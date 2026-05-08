@@ -14,7 +14,7 @@
 //! 2. Generate the requested synthetic RGB24 input pattern.
 //! 3. Write the synthetic input out (proving the CLI plumbing).
 //!
-//! Round-4 candidate: when `oxideav-vfw` grows
+//! Round-5 candidate (still): when `oxideav-vfw` grows
 //! `Sandbox::ic_compress_query` / `ic_compress_begin` /
 //! `ic_compress` / `ic_compress_end` (mirroring the existing
 //! decompress wrappers + dispatching to `ICM_COMPRESS_QUERY` /
@@ -22,7 +22,10 @@
 //! `vfw.h` macro values 0x4008 / 0x4001 / 0x4002 / 0x4007 in the
 //! Windows 10 SDK), the encode subcommand wires through the same
 //! pattern as `decode.rs`. Until then this path stays a
-//! synthetic-frame generator + open-only smoke test.
+//! synthetic-frame generator + open-only smoke test. (The vfw
+//! round-20 dispatch that was expected to ship the wrappers
+//! during oxideav-tracevfw round 4 did not land in time, so P3
+//! deferred to round 5 / vfw r21.)
 
 use anyhow::{Context, Result};
 use oxideav_vfw::{Sandbox, DLL_PROCESS_ATTACH};

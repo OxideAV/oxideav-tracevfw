@@ -68,7 +68,22 @@ use std::sync::{Arc, Mutex};
 /// server prints `[gdb] listening on …` to stderr with the
 /// chosen port (the integration test parses this line to find
 /// the server).
-pub fn run_gdb_server(addr: &str, dll_path: &Path, max_instr: u64) -> Result<()> {
+///
+/// `trace_output`, when `Some`, is honoured as the underlying
+/// JSONL sink — every `kind=mem_read` / `kind=mem_write` /
+/// `kind=trap` / `kind=exec` / `kind=win32_call` line the MMU
+/// emits gets written verbatim there in addition to being scanned
+/// for watchpoint hits. Pairing `--gdb` with `--trace-output`
+/// lets an operator observe the full event tape while a GDB
+/// client drives the sandbox interactively. When `None`, only
+/// the watchpoint-decoding tap is wired and the bytes are
+/// dropped (so they don't clobber the GDB stub's stderr output).
+pub fn run_gdb_server(
+    addr: &str,
+    dll_path: &Path,
+    max_instr: u64,
+    trace_output: Option<&Path>,
+) -> Result<()> {
     // 1. Sandbox setup — load DLL + run DllMain so the codec's
     //    per-process state is initialised before we hand control
     //    to the operator. Halting strictly pre-DllMain is rarely
@@ -114,8 +129,20 @@ pub fn run_gdb_server(addr: &str, dll_path: &Path, max_instr: u64) -> Result<()>
     let (stream, peer) = listener.accept().context("accept")?;
     eprintln!("[gdb] connection from {peer}");
 
-    // 3. Build the Target, run the event loop.
-    let mut target = SandboxTarget::new(sandbox);
+    // 3. Build the Target, run the event loop. If the operator
+    //    asked for `--trace-output FILE`, open it and hand it to
+    //    the WatchSink as the underlying forward sink so the full
+    //    JSONL tape lands on disk while we tee the watchpoint
+    //    events into the GDB stub.
+    let forward: Option<Box<dyn Write + Send>> = match trace_output {
+        Some(p) => {
+            let f = std::fs::File::create(p)
+                .with_context(|| format!("creating trace output {}", p.display()))?;
+            Some(Box::new(f))
+        }
+        None => None,
+    };
+    let mut target = SandboxTarget::with_forward(sandbox, forward);
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = Box::new(stream);
     let stub = GdbStub::new(connection);
 
@@ -205,10 +232,9 @@ type WatchHitQueue = Arc<Mutex<VecDeque<WatchHit>>>;
 /// minimal byte-level scanner is enough — we don't need a real
 /// JSON parser. Lines we don't recognise (e.g. `kind=win32_call`,
 /// `kind=trap`, `kind=exec`) are forwarded to the underlying sink
-/// unchanged so an operator using `--trace-output` simultaneously
-/// with `--gdb` would still get the full event tape (currently
-/// `--gdb` doesn't honour `--trace-output`, but the forward path
-/// is plumbed through for symmetry + future use).
+/// unchanged so an operator pairing `--trace-output FILE` with
+/// `--gdb` gets the full event tape on disk while the GDB client
+/// drives the sandbox interactively (round-4 P1).
 struct WatchSink {
     /// Per-line buffer — accumulates bytes until `\n`, then we
     /// scan the assembled line for the watchpoint shapes.
@@ -337,14 +363,27 @@ pub struct SandboxTarget {
 }
 
 impl SandboxTarget {
-    pub fn new(mut sandbox: Sandbox) -> Self {
-        // Install our JSONL tap as the trace sink so the MMU's
-        // `maybe_emit_*` probes route into our watch-hit queue.
-        // Forwarded bytes (currently dropped to avoid clobbering
-        // the GDB stub's stderr framing) can be wired to a file
-        // sink in a future round.
+    /// Build a `SandboxTarget` that drops every JSONL trace byte
+    /// emitted by the sandbox and only forwards watchpoint hits
+    /// to the GDB stop-reason path. This is the right default
+    /// when the operator did not pass `--trace-output` — the GDB
+    /// client doesn't want raw JSONL bytes interleaved with its
+    /// RSP framing. (`#[cfg(test)]` because the binary path
+    /// always reaches `with_forward` directly; tests retain the
+    /// shorter spelling for clarity.)
+    #[cfg(test)]
+    pub fn new(sandbox: Sandbox) -> Self {
+        Self::with_forward(sandbox, None)
+    }
+
+    /// Build a `SandboxTarget` whose underlying [`WatchSink`]
+    /// forwards every byte the MMU emits to `forward` (typically
+    /// a `File` opened from `--trace-output`). The watchpoint
+    /// stop-reason path is wired regardless. Round-4 P1 wires
+    /// `--trace-output` through to here from `main.rs`.
+    pub fn with_forward(mut sandbox: Sandbox, forward: Option<Box<dyn Write + Send>>) -> Self {
         let watch_queue: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
-        let sink = WatchSink::new(watch_queue.clone(), None);
+        let sink = WatchSink::new(watch_queue.clone(), forward);
         sandbox.set_trace_sink(Box::new(sink));
         Self {
             sandbox,
@@ -916,8 +955,8 @@ mod tests {
     #[test]
     fn watch_sink_forwards_to_underlying_writer() {
         // An operator can pair `--gdb` with `--trace-output FILE`
-        // (round-4 candidate) — verify the forward path passes
-        // bytes through verbatim.
+        // (round-4 P1) — verify the forward path passes bytes
+        // through verbatim.
         let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
         let captured: Vec<u8> = Vec::new();
         let forward = Box::new(std::io::Cursor::new(captured));
@@ -931,8 +970,81 @@ mod tests {
         // The Cursor is consumed by `forward` so we can't read
         // it back here without retaining a handle — but the
         // `write_all` returning Ok proves the forward path was
-        // exercised. Real-world callers retain an `Arc<Mutex>`-
-        // wrapped writer for inspection.
+        // exercised. The end-to-end "trace_output writes
+        // through `--gdb`" path is covered by
+        // `with_forward_routes_jsonl_into_supplied_sink` below.
+    }
+
+    /// Round-4 P1 — the `with_forward` constructor wires the
+    /// caller's `Box<dyn Write + Send>` through the WatchSink so
+    /// `--trace-output FILE` works simultaneously with `--gdb`.
+    /// Reuses the `cpu_step_with_watchpoint_enqueues_watch_hit`
+    /// scaffolding (mov [edi], eax; hlt) but replaces the
+    /// "drop bytes" sink with a shared `Vec<u8>` we can inspect.
+    #[test]
+    fn with_forward_routes_jsonl_into_supplied_sink() {
+        // Shared buffer we hand to the WatchSink — wrapped in
+        // Arc<Mutex<…>> so we can both write to it (via the
+        // SharedWriter adapter) and read it back after the step.
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut sb = Sandbox::new();
+        const CODE_BASE: u32 = 0x20001000;
+        const DATA_BASE: u32 = 0x60000000;
+        sb.mmu.map(
+            CODE_BASE,
+            0x1000,
+            oxideav_vfw::emulator::Perm::R | oxideav_vfw::emulator::Perm::X,
+        );
+        sb.mmu.map(
+            DATA_BASE,
+            0x1000,
+            oxideav_vfw::emulator::Perm::R | oxideav_vfw::emulator::Perm::W,
+        );
+        // mov [edi], eax ; hlt
+        sb.mmu
+            .write_initializer(CODE_BASE, &[0x89, 0x07, 0xF4])
+            .unwrap();
+        sb.cpu.regs.eip = CODE_BASE;
+        sb.cpu.regs.gp[Reg32::Eax as usize] = 0xCAFEF00D;
+        sb.cpu.regs.gp[Reg32::Edi as usize] = DATA_BASE + 0x100;
+        sb.watch(DATA_BASE + 0x100, 4, WatchMode::Write);
+
+        let forward: Box<dyn Write + Send> = Box::new(SharedWriter(captured.clone()));
+        let mut t = SandboxTarget::with_forward(sb, Some(forward));
+
+        let r = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
+        assert_eq!(r, oxideav_vfw::emulator::isa_int::StepOk::Continued);
+
+        // Watch hit also landed in the queue (the GDB path is
+        // unaffected by the forward sink).
+        let drained: Vec<_> = t.watch_queue.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+
+        // The forwarded buffer should contain the raw JSONL
+        // `mem_write` line — same contract `--trace-output FILE`
+        // gives operators when running without `--gdb`.
+        let bytes = captured.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains(r#""kind":"mem_write""#),
+            "expected forwarded JSONL to contain mem_write event, got: {s:?}"
+        );
+        assert!(
+            s.contains("60000100") || s.contains("0x60000100"),
+            "expected forwarded JSONL to mention the watched address, got: {s:?}"
+        );
     }
 
     #[test]

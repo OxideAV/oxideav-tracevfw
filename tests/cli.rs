@@ -17,6 +17,30 @@ fn write_synth_dll() -> tempfile_path::TempPath {
     tempfile_path::write_temp("synth_dll", "dll", &bytes)
 }
 
+/// Build a temp file containing the synthetic minimal DLL with a
+/// `mov [edi], eax ; hlt` sled patched into `.text` at RVA 0x1008
+/// (file offset 0x208). The `.text` section has 0x10 bytes of
+/// `virtual_size` and DllMain itself (`C2 0C 00`) sits at 0x1000,
+/// so 0x1008 is comfortably reserved padding. Used by the round-4
+/// P2 watchpoint protocol test below — it overrides EIP via the
+/// GDB `G` packet (full register file) to point here, sets EDI
+/// to a writable `.rdata` address, then runs `c` and waits for
+/// the `T05watch:…;` reply.
+fn write_synth_dll_with_writer_sled() -> tempfile_path::TempPath {
+    let mut bytes = oxideav_vfw::pe::test_image::build_minimal_dll();
+    // .text raw data starts at file offset 0x200 (FILE_ALIGN). The
+    // entry-point opcode (`ret 12` = C2 0C 00) lives at 0x200..0x203;
+    // we patch the writer at 0x208 so a single-step from VA
+    // 0x10001008 executes `mov [edi], eax` (a write the MMU's
+    // watch probe will see) followed by `hlt` (which stops the
+    // CPU cleanly via `StepOk::Halted`).
+    let sled_off = 0x208;
+    bytes[sled_off] = 0x89; // mov r/m32, r32 (opcode)
+    bytes[sled_off + 1] = 0x07; // ModR/M: mod=00 reg=eax(0) r/m=edi(7) → [edi]
+    bytes[sled_off + 2] = 0xF4; // hlt
+    tempfile_path::write_temp("synth_dll_sled", "dll", &bytes)
+}
+
 #[test]
 fn probe_subcommand_against_synth_dll_succeeds() {
     let dll = write_synth_dll();
@@ -201,6 +225,230 @@ fn gdb_flag_starts_rsp_server_and_speaks_protocol() {
 
     // The server should exit cleanly after the detach. Give it a
     // moment, then reap.
+    drop(sock);
+    let _ = child.wait();
+}
+
+/// Round-4 P2 — drive the GDB Remote Serial Protocol over a
+/// real TCP socket, set a `Z2` write watchpoint at a known
+/// `.rdata` address, point EIP at the patched `mov [edi], eax;
+/// hlt` sled in `.text`, send `c`, and verify the server
+/// replies with the `T05watch:…;` stop-reason packet that GDB
+/// uses to surface watchpoint hits.
+///
+/// No `gdb` binary needed — we hand-craft RSP frames so the
+/// test runs unmodified on any host with a TCP loopback.
+#[test]
+fn z2_watchpoint_via_rsp_returns_t05_watch_stop_reason() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll_with_writer_sled();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    // Find the chosen port by reading stderr until "[gdb] listening on …".
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered_stderr = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered_stderr.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                let p = rest[colon + 1..].trim();
+                port = p.parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("did not see [gdb] listening on …; stderr so far:\n{buffered_stderr}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    fn expect_ok(sock: &mut TcpStream, payload: &str, what: &str) -> String {
+        sock.write_all(&rsp_packet(payload))
+            .unwrap_or_else(|e| panic!("write {what}: {e}"));
+        read_packet(sock)
+    }
+
+    // 1. qSupported handshake — sets up packet sizes / features.
+    let resp = expect_ok(
+        &mut sock,
+        "qSupported:multiprocess+;swbreak+;hwbreak+",
+        "qSupported",
+    );
+    assert!(
+        !resp.is_empty() && (resp.contains("PacketSize") || resp.contains("hwbreak")),
+        "qSupported reply unexpected: {resp:?}"
+    );
+
+    // 2. Read the entire register file with `g`, then write it
+    //    back via `G` with EAX / EDI / EIP overridden. The
+    //    `gdbstub` 0.7 stub does not advertise `SingleRegisterAccess`
+    //    here (we never enabled the extension on `SandboxTarget`),
+    //    so `P` would return an empty reply — the bulk-register
+    //    `G` path is what the GDB protocol guarantees is always
+    //    available.
+    //
+    //    The X86_SSE register layout starts with the eight 32-bit
+    //    GP regs (EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI), then
+    //    EIP and EFLAGS. Each is encoded as 4 little-endian hex
+    //    bytes (= 8 hex chars). RSP run-length encoding may
+    //    compress runs in the response, so we expand it before
+    //    editing.
+    //
+    //    EIP ← 0x10001008 (the patched sled — `mov [edi], eax; hlt`).
+    //    EAX ← 0xCAFEF00D (sentinel value to be stored).
+    //    EDI ← 0x10002800 (.rdata is R+W from VA 0x10002000 to
+    //          0x10004000 in the synth DLL — well clear of the
+    //          export / import / IAT ranges below 0x10002800).
+    const TARGET_ADDR: u32 = 0x10002800;
+    const SLED_VA: u32 = 0x10001008;
+    const SENTINEL: u32 = 0xCAFEF00D;
+
+    /// Decode the gdbstub `g` reply, expanding any run-length
+    /// encoding (`X*N` → repeat-N-1-times of `X`, where N is the
+    /// printable byte after `*`, decoded as `N - 29` repeats per
+    /// the GDB protocol manual).
+    fn rsp_unrle(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 2);
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '*' && i + 1 < bytes.len() && !out.is_empty() {
+                let n = bytes[i + 1] as i32 - 29;
+                let last = *out.as_bytes().last().unwrap() as char;
+                for _ in 0..n {
+                    out.push(last);
+                }
+                i += 2;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn write_le32_at(hex: &mut String, byte_offset: usize, value: u32) {
+        let bytes = value.to_le_bytes();
+        let s = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        );
+        let char_offset = byte_offset * 2;
+        hex.replace_range(char_offset..char_offset + 8, &s);
+    }
+
+    sock.write_all(&rsp_packet("g")).expect("write g");
+    let regs_hex_raw = read_packet(&mut sock);
+    let mut regs_hex = rsp_unrle(&regs_hex_raw);
+    // X86_SSE: GPRs occupy bytes 0..32 (8 × 4), EIP at byte 32,
+    // EFLAGS at byte 36, then segment / FPU / XMM / MXCSR.
+    write_le32_at(&mut regs_hex, 0, SENTINEL); // EAX
+    write_le32_at(&mut regs_hex, 28, TARGET_ADDR); // EDI (offset 7 × 4)
+    write_le32_at(&mut regs_hex, 32, SLED_VA); // EIP
+
+    let resp = expect_ok(&mut sock, &format!("G{regs_hex}"), "G all regs");
+    assert_eq!(resp, "OK", "G reply: {resp:?}");
+
+    // 3. Set a write watchpoint at TARGET_ADDR, length 4. RSP `Z2`
+    //    is the wire packet for `WatchKind::Write` — gdbstub
+    //    routes it into our `HwWatchpoint::add_hw_watchpoint`.
+    let resp = expect_ok(
+        &mut sock,
+        &format!("Z2,{:x},4", TARGET_ADDR),
+        "Z2 watchpoint",
+    );
+    assert_eq!(resp, "OK", "Z2 reply: {resp:?}");
+
+    // 4. Continue. The CPU executes `mov [edi], eax` — a
+    //    4-byte store to TARGET_ADDR — which trips the watch.
+    //    The server should reply with `T05watch:<addr>;<rest>`.
+    sock.write_all(&rsp_packet("c")).expect("write c");
+    let stop = read_packet(&mut sock);
+    assert!(
+        stop.starts_with("T05"),
+        "expected T05 stop reason after watchpoint hit, got {stop:?}"
+    );
+    assert!(
+        stop.contains("watch:"),
+        "expected `watch:` field in stop reason, got {stop:?}"
+    );
+    // The `watch:` field carries the faulting address as
+    // big-endian hex (per the GDB protocol's stop-reply syntax).
+    // gdbstub may emit a leading-zero-trimmed form, so we check
+    // for the address as-written or its ascii substring.
+    let target_hex = format!("{:x}", TARGET_ADDR);
+    assert!(
+        stop.contains(&target_hex) || stop.contains(&target_hex.to_uppercase()),
+        "expected watched address {target_hex} in stop reply, got {stop:?}"
+    );
+
+    // 5. Detach + reap.
+    let resp = expect_ok(&mut sock, "D", "detach");
+    assert_eq!(resp, "OK", "detach reply: {resp:?}");
     drop(sock);
     let _ = child.wait();
 }

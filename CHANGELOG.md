@@ -16,6 +16,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 4 — `--gdb` honours `--trace-output FILE` (P1).**
+  `run_gdb_server` now accepts an optional trace-output path and
+  threads it through a new `SandboxTarget::with_forward`
+  constructor that hands the underlying `Box<dyn Write + Send>`
+  to the existing `WatchSink` forward path. Operators pairing
+  `--gdb HOST:PORT` with `--trace-output run.jsonl` get the
+  full `kind=mem_*` / `kind=trap` / `kind=exec` /
+  `kind=win32_call` event tape on disk while a GDB client drives
+  the sandbox interactively. Watchpoint stop-reasons still surface
+  to the GDB client unchanged.
+- **Round 4 — Z2 watchpoint protocol-level integration test (P2).**
+  New `z2_watchpoint_via_rsp_returns_t05_watch_stop_reason` test
+  spawns the binary, parses the OS-chosen port from
+  `[gdb] listening on …`, hand-crafts RSP packets over a real
+  TCP socket: `qSupported` → `g` (read regs, expanding RSP
+  run-length encoding) → `G` (write regs back with EAX, EDI, EIP
+  overridden to point at a `mov [edi], eax; hlt` sled patched
+  into a synthetic minimal-PE32 DLL's `.text` padding) → `Z2`
+  (write watchpoint at the destination address) → `c` (continue).
+  Asserts the server replies with `T05…watch:<addr>;…` — the GDB
+  stop-reply syntax for hardware-watchpoint hits — without
+  needing any `gdb` binary on the test host.
 - **Round 3 — watchpoint-hit `Watch` stop-reason wiring (P1).**
   `gdb.rs` now installs a JSONL tap on the sandbox's trace sink
   (`WatchSink`) that decodes `kind=mem_read` / `kind=mem_write`
