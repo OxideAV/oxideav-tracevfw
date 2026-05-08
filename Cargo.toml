@@ -13,13 +13,13 @@ keywords = ["multimedia", "codec", "vfw", "debugger", "trace"]
 categories = ["multimedia", "command-line-utilities"]
 
 [dependencies]
-# Path-dep for round 1 — the `trace` Cargo feature lands first on
-# oxideav-vfw master, then ships in a release. Once that release is
-# on crates.io we can drop the path = "..." prefix and depend on
-# `oxideav-vfw = { version = "0.0", features = ["trace"] }`. Until
-# then the path keeps the CLI buildable against the in-tree feature
-# work.
-oxideav-vfw = { path = "../oxideav-vfw", features = ["trace"] }
+# `oxideav-vfw` consumed as a published crate. Until a release ships
+# with the `trace` feature gate (it lives in oxideav-vfw master at
+# d59556e but each crate-version is published by release-plz on the
+# producer's master push), this dep will fail to resolve and CI will
+# be red. That's intentional: producer publish must precede consumer
+# build, and we don't shim around it with a path-dep.
+oxideav-vfw = { version = "0.0", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # Round-2 GDB Remote Serial Protocol server. `gdbstub` is the
