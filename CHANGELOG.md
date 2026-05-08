@@ -6,6 +6,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `oxideav-vfw` dep bumped to `version = "0.1"` (was `"0.0"`).
+  `oxideav-vfw 0.1.0` shipped 2026-05-08 with the `trace` Cargo
+  feature, so the path-dep workaround the round-1 commit message
+  contemplated was never needed: the consumer side resolves
+  cleanly off the published producer.
+
 ### Added
 
 - **Round 2 — GDB Remote Serial Protocol server (`--gdb HOST:PORT`).**

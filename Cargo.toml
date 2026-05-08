@@ -13,13 +13,9 @@ keywords = ["multimedia", "codec", "vfw", "debugger", "trace"]
 categories = ["multimedia", "command-line-utilities"]
 
 [dependencies]
-# `oxideav-vfw` consumed as a published crate. Until a release ships
-# with the `trace` feature gate (it lives in oxideav-vfw master at
-# d59556e but each crate-version is published by release-plz on the
-# producer's master push), this dep will fail to resolve and CI will
-# be red. That's intentional: producer publish must precede consumer
-# build, and we don't shim around it with a path-dep.
-oxideav-vfw = { version = "0.0", features = ["trace"] }
+# `oxideav-vfw` consumed as a published crate. The `trace` feature
+# gate landed in oxideav-vfw 0.1.0 (published 2026-05-08).
+oxideav-vfw = { version = "0.1", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 # Round-2 GDB Remote Serial Protocol server. `gdbstub` is the
