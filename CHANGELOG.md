@@ -13,8 +13,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   feature, so the path-dep workaround the round-1 commit message
   contemplated was never needed: the consumer side resolves
   cleanly off the published producer.
+- **Round 5 — `gdb::run_gdb_server` signature gains `cli_breakpoints`.**
+  Existing callers (`main.rs`) now pass the `--break` PC list
+  through. `SandboxTarget::with_forward` likewise grew the
+  `cli_breakpoints` argument; the `Box<dyn Write + Send>` forward
+  parameter is now `Arc<Mutex<Option<…>>>` (`ForwardSink`) so the
+  GDB event loop and the sandbox's trace tap can both write to
+  the same JSONL stream without serialising through one owner.
 
 ### Added
+
+- **Round 5 — single-register `P`/`p` packet support (P1).**
+  `SandboxTarget` now implements `gdbstub::target::ext::base::
+  single_register_access::SingleRegisterAccess<()>`, advertised
+  via `support_single_register_access`. GDB clients can read
+  (`p<reg>`) or write (`P<reg>=<le-hex>`) a single register
+  without rolling the whole `g`/`G` register file. Reg IDs cover
+  the eight GPRs (0..=7), EIP (8), EFLAGS (9), and the eight
+  ST(i) MMX-aliased FPU stack entries; segments / FPU internal
+  / XMM / MXCSR are accepted but zero-filled because the sandbox
+  does not model them — same surface as the existing bulk
+  register-file path. New TCP-only integration test
+  `p_packet_single_register_write_is_acknowledged` exercises
+  `P0=…` (EAX) → `p0` (read-back) → `P8=…` (EIP) → `p8` over a
+  real RSP socket.
+- **Round 5 — `--break <PC>` JSONL events under `--gdb` (P2).**
+  The CLI `--break` flag is now honoured by the GDB event loop:
+  PCs are auto-installed as software breakpoints (so a connected
+  GDB client halts at each one) AND every time guest EIP lands
+  on one during a `c` step slice, the loop emits a synthetic
+  `{"kind":"breakpoint","addr":"0x…","eip":"0x…"}` JSONL line
+  into the `--trace-output FILE` forward sink. Useful for the
+  detached-client case: an operator running
+  `oxidetracevfw codec.dll --gdb :1234 --break 0x10001234
+  --trace-output run.jsonl` gets the breakpoint hits on disk
+  alongside the rest of the JSONL event tape, independent of
+  any client `c`/`s` interaction. New integration test
+  `gdb_break_flag_emits_kind_breakpoint_into_trace_output`
+  drives the binary end-to-end via RSP and inspects the
+  resulting trace file.
 
 - **Round 4 — `--gdb` honours `--trace-output FILE` (P1).**
   `run_gdb_server` now accepts an optional trace-output path and

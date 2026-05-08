@@ -22,11 +22,18 @@ fn main() -> Result<()> {
     let args = Cli::parse();
 
     if let Some(addr) = args.gdb.as_deref() {
+        // Round-5 P2 — `--break PC` is now honoured under
+        // `--gdb`: PCs are pre-registered as software breakpoints
+        // (so a GDB client that attaches halts at each one) AND
+        // the event loop emits `kind=breakpoint` JSONL lines into
+        // `--trace-output FILE` whenever guest EIP lands on one.
+        let breakpoints = trace::parse_breakpoints(&args.breakpoints)?;
         return gdb::run_gdb_server(
             addr,
             &args.dll_or_ax_file,
             args.max_instr,
             args.trace_output.as_deref(),
+            &breakpoints,
         );
     }
 

@@ -229,6 +229,316 @@ fn gdb_flag_starts_rsp_server_and_speaks_protocol() {
     let _ = child.wait();
 }
 
+/// Round-5 P2 — `--gdb` paired with `--break` PCs and
+/// `--trace-output FILE` writes a `kind=breakpoint` JSONL event
+/// every time guest EIP lands on a registered `--break`. We
+/// pre-seed the synth-DLL writer sled (mov [edi], eax; hlt at
+/// VA 0x10001008), set EIP via the GDB `G` packet, register a
+/// breakpoint at 0x1000100A (post-`mov`, on the `hlt`), continue
+/// until halt, then inspect the trace file. Because the
+/// breakpoint is on the `hlt` (which `StepOk::Halted`s
+/// immediately), we expect at least one `kind=breakpoint` entry
+/// matching that PC.
+#[test]
+fn gdb_break_flag_emits_kind_breakpoint_into_trace_output() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll_with_writer_sled();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+
+    // Allocate a unique trace-output file. We let the test
+    // helper handle cleanup by holding a TempPath we'll inspect
+    // before drop.
+    let trace_path = tempfile_path::write_temp("trace_bp", "jsonl", b"");
+
+    // Breakpoint = post-`mov` PC. The sled at file offset 0x208
+    // → VA 0x10001008. After `mov [edi], eax` (2 bytes), EIP
+    // = 0x1000100A which lands on `hlt`.
+    const BP_PC: u32 = 0x1000100A;
+
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .arg("--break")
+        .arg(format!("0x{BP_PC:08X}"))
+        .arg("--trace-output")
+        .arg(trace_path.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // Handshake.
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet(&mut sock);
+
+    // Override EIP / EAX / EDI via single-register P packets
+    // (the round-5 P1 path) so we don't need to roll the whole
+    // register file. EIP = 0x10001008 (sled), EAX = 0xCAFEF00D
+    // (sentinel store value), EDI = 0x10002800 (.rdata is R+W
+    // here per the synth DLL layout).
+    let writes = [
+        ("P0=0df0feca", "EAX"),
+        ("P7=00280010", "EDI"),
+        ("P8=08100010", "EIP"),
+    ];
+    for (pkt, what) in writes {
+        sock.write_all(&rsp_packet(pkt))
+            .unwrap_or_else(|e| panic!("write {what}: {e}"));
+        let resp = read_packet(&mut sock);
+        assert_eq!(resp, "OK", "{what} write failed: {resp:?}");
+    }
+
+    // Continue. CPU executes `mov [edi], eax` then advances EIP
+    // to BP_PC = 0x1000100A which is the `hlt` instruction.
+    // Before the next step the event loop notices EIP matches
+    // our `--break` PC and emits `kind=breakpoint`. Then the
+    // `hlt` halts the CPU and the loop returns Exited(0).
+    sock.write_all(&rsp_packet("c")).expect("write c");
+    let stop = read_packet(&mut sock);
+    // Either SwBreak (we auto-installed BP_PC into sw_bps too)
+    // or Exited — both are fine. The breakpoint event itself is
+    // what we're testing, not the GDB stop-reason.
+    assert!(
+        stop.starts_with("S05") || stop.starts_with("T05") || stop.starts_with("W"),
+        "unexpected stop reply: {stop:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+
+    // Inspect the trace file.
+    let bytes = std::fs::read(trace_path.path()).expect("read trace output");
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(
+        s.contains(r#""kind":"breakpoint""#),
+        "expected kind=breakpoint event in trace file, got:\n{s}"
+    );
+    let pc_str = format!("0x{BP_PC:08x}");
+    assert!(
+        s.contains(&pc_str),
+        "expected breakpoint PC {pc_str} in trace file, got:\n{s}"
+    );
+}
+
+/// Round-5 P1 — exercise the `P` (single-register write) and
+/// `p` (single-register read) RSP packets. The server now
+/// advertises the `SingleRegisterAccess` extension on
+/// `SandboxTarget`, so a GDB client can roll a single register
+/// without sending the entire `G`-packet register file. We
+/// confirm `P0=…` (write EAX) is acknowledged with `OK` and
+/// `p0` (read EAX) returns the updated 8-hex-char value.
+///
+/// Register IDs in the `gdbstub_arch::x86::X86_SSE` description
+/// match GDB's standard X86_32 ordering: 0=EAX, 1=ECX, 2=EDX,
+/// 3=EBX, 4=ESP, 5=EBP, 6=ESI, 7=EDI, 8=EIP, 9=EFLAGS, …
+#[test]
+fn p_packet_single_register_write_is_acknowledged() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // 1. qSupported handshake — advertises packet sizes / features.
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet(&mut sock);
+
+    // 2. P0=…  → write EAX = 0xDEADBEEF (LE hex bytes).
+    //    The wire encoding is `P<reg_id_hex>=<value_le_hex>`. For
+    //    EAX (reg id 0) holding 0xDEADBEEF, that's
+    //    "P0=efbeadde". gdbstub replies `OK` if accepted.
+    sock.write_all(&rsp_packet("P0=efbeadde"))
+        .expect("write P0");
+    let resp = read_packet(&mut sock);
+    assert_eq!(
+        resp, "OK",
+        "expected OK to P0 single-register write, got {resp:?}"
+    );
+
+    // 3. p0 → read EAX back. Expect 8 hex chars = "efbeadde"
+    //    (LE encoding of 0xDEADBEEF).
+    sock.write_all(&rsp_packet("p0")).expect("write p0");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.eq_ignore_ascii_case("efbeadde"),
+        "expected EAX read to return efbeadde, got {resp:?}"
+    );
+
+    // 4. P8=… → write EIP = 0x10001234. Reg id 8 = EIP.
+    sock.write_all(&rsp_packet("P8=34120010"))
+        .expect("write P8");
+    let resp = read_packet(&mut sock);
+    assert_eq!(resp, "OK", "expected OK to P8 (EIP) write, got {resp:?}");
+
+    // 5. p8 → read EIP back.
+    sock.write_all(&rsp_packet("p8")).expect("write p8");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.eq_ignore_ascii_case("34120010"),
+        "expected EIP read to return 34120010, got {resp:?}"
+    );
+
+    // 6. Detach + reap.
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let detach_resp = read_packet(&mut sock);
+    assert_eq!(detach_resp, "OK", "expected OK to D, got {detach_resp:?}");
+    drop(sock);
+    let _ = child.wait();
+}
+
 /// Round-4 P2 — drive the GDB Remote Serial Protocol over a
 /// real TCP socket, set a `Z2` write watchpoint at a known
 /// `.rdata` address, point EIP at the patched `mov [edi], eax;
