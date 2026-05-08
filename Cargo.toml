@@ -1,0 +1,28 @@
+[package]
+name = "oxideav-tracevfw"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Trace + debug CLI for oxideav-vfw — load a Windows codec DLL/AX, probe it, encode/decode test data, log memory watches, set PC breakpoints"
+repository = "https://github.com/OxideAV/oxideav-tracevfw"
+homepage = "https://github.com/OxideAV/oxideav-tracevfw"
+readme = "README.md"
+keywords = ["multimedia", "codec", "vfw", "debugger", "trace"]
+categories = ["multimedia", "command-line-utilities"]
+
+[dependencies]
+# Path-dep for round 1 — the `trace` Cargo feature lands first on
+# oxideav-vfw master, then ships in a release. Once that release is
+# on crates.io we can drop the path = "..." prefix and depend on
+# `oxideav-vfw = { version = "0.0", features = ["trace"] }`. Until
+# then the path keeps the CLI buildable against the in-tree feature
+# work.
+oxideav-vfw = { path = "../oxideav-vfw", features = ["trace"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[[bin]]
+name = "oxidetracevfw"
+path = "src/main.rs"
