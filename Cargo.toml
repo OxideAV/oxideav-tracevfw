@@ -22,6 +22,12 @@ categories = ["multimedia", "command-line-utilities"]
 oxideav-vfw = { path = "../oxideav-vfw", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Round-2 GDB Remote Serial Protocol server. `gdbstub` is the
+# well-known pure-Rust RSP implementation (MIT/0BSD-licensed),
+# `gdbstub_arch` ships the X86 32-bit register layout we hand to
+# the GDB client.
+gdbstub = "0.7"
+gdbstub_arch = "0.3"
 
 [[bin]]
 name = "oxidetracevfw"

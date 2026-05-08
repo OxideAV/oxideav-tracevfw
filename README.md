@@ -7,9 +7,10 @@ watchpoints, and dump CPU state at PC breakpoints. Output is JSONL,
 one event per line, on a sink configured by `--trace-output` or
 the `OXIDEAV_VFW_TRACE_FILE` environment variable.
 
-GDB Remote Serial Protocol server support is **deferred to round 2**
-of this crate; see `src/gdb.rs` for the placeholder + the design
-note for what the round-2 wrapper around `gdbstub` will look like.
+Round 2 adds a **GDB Remote Serial Protocol server** so a real
+`gdb` (or any RSP-speaking client) can drive the sandbox
+interactively — see `--gdb HOST:PORT` below + `src/gdb.rs` for
+the `gdbstub`-backed `Target` implementation.
 
 [oxideav-vfw]: https://github.com/OxideAV/oxideav-vfw
 
@@ -32,6 +33,20 @@ oxidetracevfw IR32_32.DLL \
 # Drive synthetic encode against the codec.
 oxidetracevfw IR32_32.DLL encode --width 320 --height 240 \
     --pattern gradient --output /tmp/encoded.iv31
+
+# GDB-attached interactive session: bind on port 1234, halt
+# the CPU pre-execution, and wait for `gdb`.
+oxidetracevfw IR32_32.DLL --gdb 0.0.0.0:1234
+
+# In another terminal:
+#   $ gdb
+#   (gdb) target remote :1234
+#   (gdb) hbreak *0x10001000
+#   (gdb) c              # continue; runs until breakpoint
+#   (gdb) si             # single-step
+#   (gdb) info reg
+#   (gdb) x/16xb 0x60000000
+#   (gdb) detach
 ```
 
 ## CLI surface
@@ -53,6 +68,9 @@ Global options:
   --trace-output <FILE>          JSONL events output (default: stderr)
   --max-instr <N>                cap total instructions to prevent runaway
   --fcc-handler <FCC>            FourCC handler override
+  --gdb <HOST:PORT>              bind a GDB Remote Serial Protocol server;
+                                 use `:0` to pick a free port (printed
+                                 to stderr as `[gdb] listening on …`)
 ```
 
 ## Provenance

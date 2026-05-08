@@ -16,8 +16,10 @@ use std::path::PathBuf;
                   workloads against it, and emits JSONL trace events at the four \
                   oxideav-vfw probe sites (Win32 calls, memory watchpoints, traps, \
                   optional per-instruction execution trace).\n\n\
-                  GDB Remote Serial Protocol support is deferred to round 2; see \
-                  src/gdb.rs."
+                  Pass `--gdb HOST:PORT` to bind a GDB Remote Serial Protocol \
+                  server (round 2): the binary loads the DLL, halts the CPU \
+                  pre-execution, and accepts one connection from gdb (or any \
+                  RSP-speaking client) — see src/gdb.rs."
 )]
 pub struct Cli {
     /// Path to the Windows codec DLL or AX filter to load.
@@ -57,9 +59,13 @@ pub struct Cli {
     #[arg(long = "fcc-handler", value_name = "FCC")]
     pub fcc_handler: Option<String>,
 
-    /// Stub for round-2 GDB Remote Serial Protocol server. Today
-    /// this flag prints "round-2 todo" via `src/gdb.rs` and
-    /// exits non-zero.
+    /// Bind a GDB Remote Serial Protocol server on `HOST:PORT`,
+    /// load the DLL, and halt the CPU before any DllMain /
+    /// ICOpen call so a `gdb` (or any RSP-speaking) client can
+    /// drive the sandbox interactively. Use `:0` to pick a free
+    /// port; the chosen port is printed to stderr as
+    /// `[gdb] listening on …`. Round 2 implementation built on
+    /// the `gdbstub` crate.
     #[arg(long = "gdb", value_name = "HOST:PORT")]
     pub gdb: Option<String>,
 

@@ -22,7 +22,7 @@ fn main() -> Result<()> {
     let args = Cli::parse();
 
     if let Some(addr) = args.gdb.as_deref() {
-        return gdb::run_gdb_server(addr);
+        return gdb::run_gdb_server(addr, &args.dll_or_ax_file, args.max_instr);
     }
 
     let mut sandbox = Sandbox::new();
