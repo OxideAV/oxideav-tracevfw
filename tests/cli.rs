@@ -1611,6 +1611,338 @@ fn qxfer_libraries_read_returns_module_registry() {
     let _ = child.wait();
 }
 
+/// Round-9 P1 — `qXfer:auxv:read` returns a synthetic
+/// ELF-style auxiliary-vector blob describing the loaded PE
+/// image. The blob is a sequence of `(u32 key, u32 value)`
+/// pairs in little-endian terminated by `(AT_NULL=0, 0)`. We
+/// drive the binary through the GDB protocol and assert:
+///
+/// 1. `qSupported` reply contains `qXfer:auxv:read+`,
+/// 2. paginated `qXfer:auxv:read::<offset>,<length>` reads
+///    reassemble into a 64-byte blob (8 entries × 8 bytes),
+/// 3. the canonical AT_* keys + values surface — particularly
+///    AT_BASE/AT_PHDR (= image_base 0x10000000), AT_ENTRY
+///    (= entry_point), AT_PAGESZ (= 0x1000), AT_NULL terminator.
+#[test]
+fn qxfer_auxv_read_returns_synthetic_aux_vector() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> Vec<u8> {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        payload
+    }
+
+    // 1. qSupported handshake — gdbstub only enables
+    //    `qXfer:auxv:read+` when the client side advertises it.
+    sock.write_all(&rsp_packet(
+        "qSupported:multiprocess+;swbreak+;hwbreak+;qXfer:auxv:read+",
+    ))
+    .expect("write qSupported");
+    let resp = String::from_utf8_lossy(&read_packet(&mut sock)).into_owned();
+    assert!(
+        resp.contains("qXfer:auxv:read+"),
+        "expected qXfer:auxv:read+ in qSupported reply, got: {resp:?}"
+    );
+
+    // 2. Paginated read of the auxv blob. The annex is empty
+    //    for auxv (`qXfer:auxv:read::offset,length`). We pull
+    //    raw bytes (no UTF-8 lossy here — the blob is binary).
+    let mut assembled: Vec<u8> = Vec::new();
+    let mut offset: u64 = 0;
+    let chunk_len: u64 = 32;
+    loop {
+        let pkt = format!("qXfer:auxv:read::{offset:x},{chunk_len:x}");
+        sock.write_all(&rsp_packet(&pkt)).expect("write qXfer");
+        let resp = read_packet(&mut sock);
+        if resp.is_empty() {
+            panic!("qXfer:auxv:read returned empty (extension not advertised)");
+        }
+        let last = resp[0] == b'l';
+        let data = &resp[1..];
+        // RLE expansion — `*N` repeats the previous char (N - 29).
+        let mut i = 0;
+        while i < data.len() {
+            let c = data[i];
+            if c == b'*' && i + 1 < data.len() && !assembled.is_empty() {
+                let n = data[i + 1] as i32 - 29;
+                let last_b = *assembled.last().unwrap();
+                for _ in 0..n {
+                    assembled.push(last_b);
+                }
+                i += 2;
+            } else {
+                assembled.push(c);
+                i += 1;
+            }
+        }
+        offset = assembled.len() as u64;
+        if last {
+            break;
+        }
+        if offset > 1024 {
+            panic!("runaway qXfer:auxv pagination — assembled {offset} bytes");
+        }
+    }
+
+    // 3. Sanity-check the blob shape: 8 entries × 8 bytes.
+    assert_eq!(
+        assembled.len(),
+        64,
+        "expected 64-byte auxv blob, got {}",
+        assembled.len()
+    );
+    let read_le32 = |off: usize| -> u32 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&assembled[off..off + 4]);
+        u32::from_le_bytes(b)
+    };
+    let pairs: Vec<(u32, u32)> = (0..assembled.len())
+        .step_by(8)
+        .map(|off| (read_le32(off), read_le32(off + 4)))
+        .collect();
+    // Synthetic DLL pins image_base = 0x10000000 and entry_point
+    // = image_base + 0x1000 (round-1 default in
+    // `pe::test_image::build_minimal_dll`).
+    assert_eq!(pairs[0], (3, 0x10000000), "AT_PHDR mismatch: {pairs:?}");
+    assert_eq!(pairs[1], (4, 40), "AT_PHENT mismatch: {pairs:?}");
+    assert_eq!(pairs[3], (6, 0x1000), "AT_PAGESZ mismatch: {pairs:?}");
+    assert_eq!(pairs[4], (7, 0x10000000), "AT_BASE mismatch: {pairs:?}");
+    assert_eq!(pairs[5], (8, 0), "AT_FLAGS mismatch: {pairs:?}");
+    assert_eq!(pairs[6], (9, 0x10001000), "AT_ENTRY mismatch: {pairs:?}");
+    assert_eq!(pairs[7], (0, 0), "AT_NULL terminator mismatch: {pairs:?}");
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
+/// Round-9 P2 — `qfThreadInfo` / `qsThreadInfo` advertise the
+/// single fixed thread the SingleThreadBase target presents.
+/// gdbstub auto-serves these queries on the strength of our
+/// `BaseOps::SingleThread` choice — there's no Target-side
+/// extension to wire. We assert the wire-level reply shape so
+/// a connected GDB client's `info threads` shows one entry
+/// instead of an empty list:
+///
+/// - `qfThreadInfo` returns `m<thread-id>` (one TID).
+/// - `qsThreadInfo` returns `l` (end-of-list, per the GDB
+///   protocol manual's iterative discovery contract).
+///
+/// The exact thread-id format depends on whether multiprocess
+/// extensions are negotiated — gdbstub uses `pPID.TID`
+/// (`p01.01`) in the multiprocess form. We accept either the
+/// multiprocess form or a bare TID (`1` / `01`).
+#[test]
+fn qfthreadinfo_advertises_single_thread() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // qSupported with multiprocess+ — required so the stub
+    // emits the multiprocess form `pPID.TID` in qfThreadInfo,
+    // matching what a real GDB client expects.
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+;hwbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet(&mut sock);
+
+    // qfThreadInfo — returns `m<thread-id>` for the first (and
+    // only) thread.
+    sock.write_all(&rsp_packet("qfThreadInfo"))
+        .expect("write qfThreadInfo");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.starts_with('m'),
+        "expected qfThreadInfo to start with 'm<tid>', got: {resp:?}"
+    );
+    let tid_part = &resp[1..];
+    // Accept either multiprocess form (`p01.01` etc.) or a bare
+    // hex TID. Anything non-empty is an actionable thread-id
+    // for the GDB client.
+    assert!(
+        !tid_part.is_empty(),
+        "qfThreadInfo TID should not be empty, got: {resp:?}"
+    );
+    // gdbstub uses lowercase hex with the multiprocess form
+    // when the client advertised `multiprocess+`.
+    if tid_part.starts_with('p') {
+        assert!(
+            tid_part.contains('.'),
+            "multiprocess thread-id should contain '.', got: {resp:?}"
+        );
+    }
+
+    // qsThreadInfo — returns `l` (end-of-list) for the
+    // single-threaded sandbox.
+    sock.write_all(&rsp_packet("qsThreadInfo"))
+        .expect("write qsThreadInfo");
+    let resp = read_packet(&mut sock);
+    assert_eq!(
+        resp, "l",
+        "expected qsThreadInfo to terminate with 'l' (end-of-list), got: {resp:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
 /// Tiny helper namespace — temp-file path with auto-delete on
 /// drop. We avoid pulling `tempfile` as a dev-dep purely to
 /// keep this crate's dependency tree light; this is ~30 LOC.

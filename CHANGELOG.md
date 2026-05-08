@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 9 — `qXfer:auxv:read` synthetic ELF auxiliary vector (P1).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::auxv::Auxv`, advertised via
+  `support_auxv`. The blob is a sequence of `(u32 key, u32 value)`
+  pairs in little-endian terminated by `(AT_NULL=0, 0)`,
+  rendered eagerly at `with_forward` construction time from
+  the loaded `oxideav_vfw::pe::Image`. Keys follow the canonical
+  System V ABI / Linux ELF auxv constants
+  (`<elf.h>` / `getauxval(3)`):
+  `AT_PHDR (3) = image_base`,
+  `AT_PHENT (4) = 40` (`IMAGE_SIZEOF_SECTION_HEADER`),
+  `AT_PHNUM (5) = sections.len()`,
+  `AT_PAGESZ (6) = 0x1000`,
+  `AT_BASE (7) = image_base`,
+  `AT_FLAGS (8) = 0`,
+  `AT_ENTRY (9) = entry_point`,
+  `AT_NULL (0) = 0`. A connected GDB client's `info auxv` now
+  decodes the codec's PE entry point + image base instead of
+  reporting "auxv unsupported". Width is 32-bit because the
+  sandbox is i386 (matches our `X86_SSE` arch description); a
+  64-bit GDB client connected to an i386 target reads auxv
+  entries as 32-bit pairs per the GDB protocol manual's
+  qXfer:auxv:read note. Four unit tests cover the canonical
+  AT_* layout, the gating predicate, pagination, and the
+  empty-sections degenerate case; one TCP-protocol integration
+  test (`qxfer_auxv_read_returns_synthetic_aux_vector`) drives
+  the binary end-to-end and asserts every key/value pair.
+- **Round 9 — `qfThreadInfo` / `qsThreadInfo` wire-level test (P2).**
+  No code change — gdbstub's `BaseOps::SingleThread` adapter
+  already auto-serves `qfThreadInfo` with the multiprocess
+  thread-id `pPID.TID` (matching what the client requested via
+  `qSupported:multiprocess+`) and `qsThreadInfo` with the
+  `l` end-of-list terminator. The new
+  `qfthreadinfo_advertises_single_thread` integration test
+  pins this contract on the wire so a connected GDB client's
+  `info threads` consistently shows a single populated thread
+  entry instead of an empty list. Also documents the round-9
+  agent's earlier hypothesis (that gdbstub's default was an
+  empty thread list) as not actually applying — the framework
+  handles single-thread targets correctly out of the box.
+
 - **Round 8 — `qXfer:libraries:read` loaded-module registry (P1).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::libraries::Libraries`, advertised via

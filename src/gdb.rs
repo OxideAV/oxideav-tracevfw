@@ -40,6 +40,7 @@ use gdbstub::common::Signal;
 use gdbstub::conn::{Connection, ConnectionExt};
 use gdbstub::stub::run_blocking::{BlockingEventLoop, Event, WaitForStopReasonError};
 use gdbstub::stub::{DisconnectReason, GdbStub, SingleThreadStopReason};
+use gdbstub::target::ext::auxv::{Auxv, AuxvOps};
 use gdbstub::target::ext::base::single_register_access::{
     SingleRegisterAccess, SingleRegisterAccessOps,
 };
@@ -572,6 +573,19 @@ pub struct SandboxTarget {
     /// gdbstub doesn't advertise the extension to a client
     /// that would then mis-display the empty payload.
     library_list_xml: String,
+    /// Round-9 P1 — synthetic ELF-style auxiliary-vector blob
+    /// served over `qXfer:auxv:read`. We're emulating a Win32
+    /// PE codec (no real ELF executable), but a connected GDB
+    /// client's `info auxv` is happier with a non-empty
+    /// well-formed reply than with the "auxv unsupported" path.
+    /// The blob is a sequence of `(u32 key, u32 value)` pairs
+    /// in little-endian terminated by `(AT_NULL=0, 0)`. The
+    /// keys are the canonical System V ABI / Linux ELF auxv
+    /// constants (see `<elf.h>` / `getauxval(3)` man page) so a
+    /// real GDB client decodes them correctly. Empty when no
+    /// PE image is available. Built eagerly at `with_forward`
+    /// construction time by [`SandboxTarget::build_auxv_blob`].
+    auxv_blob: Vec<u8>,
 }
 
 impl SandboxTarget {
@@ -642,6 +656,15 @@ impl SandboxTarget {
         // no modules are loaded yet (e.g. a non-PE blob that
         // failed to load).
         let library_list_xml = Self::build_library_list_xml(&sandbox);
+        // Round-9 P1 — render the synthetic auxv blob from the
+        // loaded PE image. Empty when no image is available; the
+        // `support_auxv` predicate gates the extension on this so
+        // gdbstub reports "unsupported" cleanly rather than
+        // serving an empty payload a client might mis-display.
+        let auxv_blob = match image.as_ref() {
+            Some(img) => Self::build_auxv_blob(img),
+            None => Vec::new(),
+        };
         Self {
             sandbox,
             sw_bps: cli_bps.clone(),
@@ -653,6 +676,7 @@ impl SandboxTarget {
             memory_map_xml,
             exec_file_name,
             library_list_xml,
+            auxv_blob,
         }
     }
 
@@ -782,6 +806,79 @@ impl SandboxTarget {
         s
     }
 
+    /// Build a synthetic ELF-style auxiliary-vector blob
+    /// describing the loaded PE image — surfaced to a connected
+    /// GDB client's `info auxv` over `qXfer:auxv:read`.
+    ///
+    /// Encoding: a sequence of `(u32 key, u32 value)` pairs in
+    /// little-endian, terminated by `(AT_NULL=0, 0)`. The keys
+    /// are the canonical System V ABI / Linux ELF auxv constants
+    /// (`<elf.h>` / `getauxval(3)`):
+    ///
+    /// - `AT_PHDR  = 3` — VA of the PE image headers (= `image_base`).
+    ///   PE has no ELF program headers, but a real GDB client's
+    ///   `info auxv` shows this as the "executable program-header
+    ///   table" pointer; pointing it at the PE headers is the
+    ///   closest semantic match.
+    /// - `AT_PHENT = 4` — size of one PE `IMAGE_SECTION_HEADER`
+    ///   (40 bytes per the PE/COFF spec). ELF clients expecting
+    ///   `Elf32_Phdr` (32 bytes) will mis-decode the entries, but
+    ///   the synthetic value is still the right shape for the
+    ///   tracevfw operator who wants to see "PE section headers
+    ///   are 40 bytes wide".
+    /// - `AT_PHNUM = 5` — number of PE sections.
+    /// - `AT_PAGESZ = 6` — emulator page size (= 0x1000).
+    /// - `AT_BASE  = 7` — load base of the codec DLL
+    ///   (= `image_base`). The PE's preferred load address.
+    /// - `AT_FLAGS = 8` — zero (no auxv flags relevant for our
+    ///   sandbox; honouring the "advertise the key, value=0 if
+    ///   unknown" Linux ABI convention).
+    /// - `AT_ENTRY = 9` — codec entry-point VA (= `entry_point`,
+    ///   already resolved to `image_base + AddressOfEntryPoint`).
+    /// - `AT_NULL  = 0` — terminator, encoded as `(0, 0)`.
+    ///
+    /// Width: 32-bit because the sandbox is i386 (matches our
+    /// `X86_SSE` arch description); a 64-bit GDB client connected
+    /// to an i386 target reads auxv entries as 32-bit pairs per
+    /// the GDB protocol manual's qXfer:auxv:read note.
+    ///
+    /// References:
+    /// - GDB RSP manual §"qXfer:auxv:read" — payload semantics.
+    ///   <https://sourceware.org/gdb/current/onlinedocs/gdb.html/General-Query-Packets.html>
+    /// - `getauxval(3)` man page — AT_* key meanings.
+    ///   <https://man7.org/linux/man-pages/man3/getauxval.3.html>
+    fn build_auxv_blob(image: &Image) -> Vec<u8> {
+        const AT_NULL: u32 = 0;
+        const AT_PHDR: u32 = 3;
+        const AT_PHENT: u32 = 4;
+        const AT_PHNUM: u32 = 5;
+        const AT_PAGESZ: u32 = 6;
+        const AT_BASE: u32 = 7;
+        const AT_FLAGS: u32 = 8;
+        const AT_ENTRY: u32 = 9;
+        // Eight (key,value) pairs × 8 bytes each = 64 bytes.
+        let mut out = Vec::with_capacity(64);
+        let mut push = |key: u32, val: u32| {
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        };
+        push(AT_PHDR, image.image_base);
+        // PE/COFF spec — `IMAGE_SECTION_HEADER` is 40 bytes
+        // (`IMAGE_SIZEOF_SECTION_HEADER`). We surface this for
+        // operators who want a hint that PE section headers are
+        // _not_ ELF Elf32_Phdr (28-byte) entries.
+        push(AT_PHENT, 40);
+        push(AT_PHNUM, image.sections.len() as u32);
+        push(AT_PAGESZ, 0x1000);
+        push(AT_BASE, image.image_base);
+        push(AT_FLAGS, 0);
+        push(AT_ENTRY, image.entry_point);
+        // AT_NULL terminator — value field is also 0 per the
+        // ELF ABI convention.
+        push(AT_NULL, 0);
+        out
+    }
+
     /// Emit a synthetic `kind=breakpoint` JSONL line on the
     /// forward sink. The shape mirrors what
     /// `oxideav_vfw::trace::TraceState::ev_*` emit for the
@@ -898,6 +995,24 @@ impl Target for SandboxTarget {
     /// for the schema.
     fn support_libraries(&mut self) -> Option<LibrariesOps<'_, Self>> {
         if self.library_list_xml.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    /// Round-9 P1 — advertise `qXfer:auxv:read` so a connected
+    /// GDB client's `info auxv` shows the codec's PE entry,
+    /// image base, and section count instead of "auxv
+    /// unsupported". The blob was rendered eagerly at
+    /// `with_forward` time from the loaded `Image`'s
+    /// `entry_point` / `image_base` / `sections.len()`. Returns
+    /// `None` when no PE image is available so gdbstub doesn't
+    /// advertise an extension we'd answer with an empty payload.
+    /// See the GDB protocol manual §"qXfer:auxv:read" and
+    /// `getauxval(3)` for the AT_* key semantics.
+    fn support_auxv(&mut self) -> Option<AuxvOps<'_, Self>> {
+        if self.auxv_blob.is_empty() {
             None
         } else {
             Some(self)
@@ -1227,6 +1342,30 @@ impl Libraries for SandboxTarget {
         buf: &mut [u8],
     ) -> TargetResult<usize, Self> {
         let bytes = self.library_list_xml.as_bytes();
+        let total = bytes.len() as u64;
+        if offset >= total {
+            return Ok(0);
+        }
+        let start = offset as usize;
+        let remaining = bytes.len() - start;
+        let n = remaining.min(length).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl Auxv for SandboxTarget {
+    /// Round-9 P1 — serve the pre-rendered ELF-style auxiliary
+    /// vector blob over the `qXfer:auxv:read` paginated
+    /// transfer. The blob was assembled at construction time
+    /// from the loaded `Image`'s `image_base` / `entry_point` /
+    /// `sections.len()` (see [`SandboxTarget::build_auxv_blob`])
+    /// so per-chunk reads are a flat byte-slice walk.
+    /// Pagination matches the GDB qXfer contract — `offset`
+    /// past the end returns `0` (gdbstub frames this as the
+    /// `l<empty>` end-of-stream reply).
+    fn get_auxv(&self, offset: u64, length: usize, buf: &mut [u8]) -> TargetResult<usize, Self> {
+        let bytes = self.auxv_blob.as_slice();
         let total = bytes.len() as u64;
         if offset >= total {
             return Ok(0);
@@ -2606,5 +2745,161 @@ mod tests {
             xml.contains(r#"<segment address="0x10000000"/>"#),
             "expected synth.dll image-base segment, got: {xml:?}"
         );
+    }
+
+    /// Round-9 P1 — `build_auxv_blob` walks the loaded PE image
+    /// and produces a sequence of `(u32 key, u32 value)` pairs in
+    /// little-endian terminated by `(AT_NULL=0, 0)`. We assert
+    /// the encoding shape + every key surfaces with the expected
+    /// value derived from the synthetic DLL's `image_base` /
+    /// `entry_point` / `sections.len()`.
+    #[test]
+    fn build_auxv_blob_encodes_canonical_at_keys() {
+        let (_, img) = synth_sandbox_with_image();
+        let blob = SandboxTarget::build_auxv_blob(&img);
+
+        // 8 entries × 8 bytes/entry = 64 bytes.
+        assert_eq!(
+            blob.len(),
+            64,
+            "expected 64-byte auxv blob (8 entries), got {} bytes",
+            blob.len()
+        );
+
+        // Decode (u32 key, u32 value) pairs in little-endian.
+        let read_le32 = |off: usize| -> u32 {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&blob[off..off + 4]);
+            u32::from_le_bytes(b)
+        };
+        let pairs: Vec<(u32, u32)> = (0..blob.len())
+            .step_by(8)
+            .map(|off| (read_le32(off), read_le32(off + 4)))
+            .collect();
+
+        // Canonical order matches `build_auxv_blob`'s layout —
+        // PHDR/PHENT/PHNUM/PAGESZ/BASE/FLAGS/ENTRY/NULL.
+        assert_eq!(
+            pairs[0],
+            (3, img.image_base),
+            "AT_PHDR(3) should equal image_base, got: {pairs:?}"
+        );
+        assert_eq!(
+            pairs[1],
+            (4, 40),
+            "AT_PHENT(4) should equal IMAGE_SIZEOF_SECTION_HEADER (40), got: {pairs:?}"
+        );
+        assert_eq!(
+            pairs[2],
+            (5, img.sections.len() as u32),
+            "AT_PHNUM(5) should equal section count, got: {pairs:?}"
+        );
+        assert_eq!(
+            pairs[3],
+            (6, 0x1000),
+            "AT_PAGESZ(6) should equal 0x1000, got: {pairs:?}"
+        );
+        assert_eq!(
+            pairs[4],
+            (7, img.image_base),
+            "AT_BASE(7) should equal image_base, got: {pairs:?}"
+        );
+        assert_eq!(pairs[5], (8, 0), "AT_FLAGS(8) should be 0, got: {pairs:?}");
+        assert_eq!(
+            pairs[6],
+            (9, img.entry_point),
+            "AT_ENTRY(9) should equal entry_point, got: {pairs:?}"
+        );
+        assert_eq!(pairs[7], (0, 0), "AT_NULL(0) terminator, got: {pairs:?}");
+    }
+
+    /// Round-9 P1 — `support_auxv` returns `Some` when an
+    /// `Image` was provided and `None` otherwise. Same gating
+    /// contract the round-7 `support_memory_map` /
+    /// `support_exec_file` predicates use: don't advertise a
+    /// qXfer extension we'd answer with an empty payload.
+    #[test]
+    fn support_auxv_gated_on_image_presence() {
+        let mut t_none = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_auxv(&mut t_none).is_none());
+
+        let (sb, img) = synth_sandbox_with_image();
+        let mut t_some = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            Some(img),
+            "synth.dll".to_string(),
+        );
+        assert!(Target::support_auxv(&mut t_some).is_some());
+    }
+
+    /// Round-9 P1 — `qXfer:auxv:read` paginates the rendered
+    /// blob correctly: assembling chunks of arbitrary length
+    /// yields the full payload, offset-past-end returns 0.
+    /// Mirrors the round-7 / round-8 pagination tests.
+    #[test]
+    fn auxv_blob_paginates_correctly() {
+        let (sb, img) = synth_sandbox_with_image();
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            Some(img),
+            "synth.dll".to_string(),
+        );
+
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 7]; // odd chunk size to exercise the slicer
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok(Auxv::get_auxv(&t, offset, buf.len(), &mut buf));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(
+            assembled.as_slice(),
+            t.auxv_blob.as_slice(),
+            "paginated reads should reassemble the full auxv blob"
+        );
+
+        // Past-EOF read returns 0.
+        let mut buf2 = [0u8; 32];
+        let n = ok(Auxv::get_auxv(
+            &t,
+            t.auxv_blob.len() as u64 + 100,
+            buf2.len(),
+            &mut buf2,
+        ));
+        assert_eq!(n, 0);
+    }
+
+    /// Round-9 P1 — `build_auxv_blob` returns a 64-byte blob
+    /// even when the image has no sections (degenerate case the
+    /// PE loader generally rejects, but the auxv builder must
+    /// not panic on it). `AT_PHNUM` ends up as 0 and the rest
+    /// of the keys still encode.
+    #[test]
+    fn build_auxv_blob_empty_sections_still_yields_terminator() {
+        let img = Image {
+            name: "empty".into(),
+            image_base: 0x40000000,
+            entry_point: 0x40001234,
+            size_of_image: 0x1000,
+            sections: Vec::new(),
+            exports: std::collections::BTreeMap::new(),
+        };
+        let blob = SandboxTarget::build_auxv_blob(&img);
+        assert_eq!(blob.len(), 64);
+        // AT_PHNUM (5) → 0 — section count is zero.
+        let phnum = u32::from_le_bytes(blob[20..24].try_into().unwrap());
+        let phnum_key = u32::from_le_bytes(blob[16..20].try_into().unwrap());
+        assert_eq!(phnum_key, 5);
+        assert_eq!(phnum, 0);
+        // AT_NULL terminator at the tail.
+        assert_eq!(&blob[56..64], &[0u8; 8]);
     }
 }
