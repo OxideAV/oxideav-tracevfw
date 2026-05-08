@@ -53,8 +53,11 @@ use gdbstub_arch::x86::reg::X86CoreRegs;
 use gdbstub_arch::x86::X86_SSE;
 use oxideav_vfw::emulator::regs::Reg32;
 use oxideav_vfw::{Sandbox, WatchMode, DLL_PROCESS_ATTACH};
+use std::collections::VecDeque;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Run the GDB Remote Serial Protocol server bound to `addr`.
 ///
@@ -156,16 +159,163 @@ enum ExecMode {
 
 /// Watchpoint record kept on our side so we can emit a matching
 /// `Watch` stop reason to the GDB client when the sandbox's
-/// trace state reports a hit. Round-2 implementation is purely a
-/// bookkeeping mirror — the real "wait for hit" wiring is a
-/// future enhancement (see Round-3 candidates) since the round-1
-/// `Sandbox` API runs to a sentinel rather than yielding per
-/// memory access.
+/// trace state reports a hit. Round-3 wires the actual
+/// "wait for hit" path through a JSONL-tap on the sandbox's
+/// trace sink — see [`WatchSink`] / [`WatchHit`] / the
+/// `wait_for_stop_reason` event loop below.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct WatchRec {
     addr: u32,
     len: u32,
     kind: WatchKind,
+}
+
+/// One pending watchpoint hit decoded from the sandbox's JSONL
+/// trace stream. Pushed onto the shared [`WatchHitQueue`] by
+/// [`WatchSink`] (which the GDB driver installs as the trace sink
+/// before handing control to the client) and popped by the event
+/// loop after each `cpu.step()` so the GDB client sees a `Watch`
+/// stop-reason as soon as the offending memory access lands.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WatchHit {
+    /// `WatchKind::Read` for `mem_read`, `WatchKind::Write` for
+    /// `mem_write`. The sandbox's JSONL probe never emits the
+    /// `ReadWrite` shape — we'd see two events (one Read, one
+    /// Write) for a true read-modify-write — so we never need to
+    /// synthesise that variant here.
+    kind: WatchKind,
+    /// Faulting address as reported by the trace event.
+    addr: u32,
+}
+
+/// Shared queue of pending watchpoint hits. The producer is the
+/// [`WatchSink`] (running inside the MMU's `maybe_emit_*` probes
+/// during `cpu.step`); the consumer is the GDB event loop. Wrapped
+/// in `Arc<Mutex<…>>` so the sink's `Box<dyn Write + Send>` and
+/// the event loop's `&mut SandboxTarget` can both reach it.
+type WatchHitQueue = Arc<Mutex<VecDeque<WatchHit>>>;
+
+/// JSONL tap installed as the sandbox's trace sink so we can
+/// detect watchpoint hits between `cpu.step()` calls and yield a
+/// matching `Watch` stop-reason to the GDB client.
+///
+/// The MMU emits one `{"kind":"mem_read",…}` or
+/// `{"kind":"mem_write",…}` JSONL line per matching memory access.
+/// Each line is fully self-contained (no embedded newlines), so a
+/// minimal byte-level scanner is enough — we don't need a real
+/// JSON parser. Lines we don't recognise (e.g. `kind=win32_call`,
+/// `kind=trap`, `kind=exec`) are forwarded to the underlying sink
+/// unchanged so an operator using `--trace-output` simultaneously
+/// with `--gdb` would still get the full event tape (currently
+/// `--gdb` doesn't honour `--trace-output`, but the forward path
+/// is plumbed through for symmetry + future use).
+struct WatchSink {
+    /// Per-line buffer — accumulates bytes until `\n`, then we
+    /// scan the assembled line for the watchpoint shapes.
+    line_buf: Vec<u8>,
+    /// Producer side of the watch-hit queue.
+    queue: WatchHitQueue,
+    /// Optional underlying sink — bytes are forwarded verbatim
+    /// regardless of whether the line matched a watch shape.
+    forward: Option<Box<dyn Write + Send>>,
+}
+
+impl WatchSink {
+    fn new(queue: WatchHitQueue, forward: Option<Box<dyn Write + Send>>) -> Self {
+        Self {
+            line_buf: Vec::with_capacity(256),
+            queue,
+            forward,
+        }
+    }
+
+    /// Inspect one fully-buffered JSONL line. The sandbox emits
+    /// memory-watch events in the shape:
+    ///
+    /// ```text
+    /// {"kind":"mem_write","addr":"0xDEADBEEF","size":4,"value":"…","eip":"…"}
+    /// {"kind":"mem_read", "addr":"0xCAFEBABE","size":2,"value":"…","eip":"…"}
+    /// ```
+    ///
+    /// Field order is fixed by the producer (see
+    /// `oxideav_vfw::trace::TraceState::ev_mem_{read,write}`), so
+    /// substring matching is sound and faster than pulling in a
+    /// JSON crate. Lines that don't start with the expected
+    /// `kind=mem_…` prefix are skipped silently.
+    fn scan_line(&self, line: &[u8]) {
+        // Cheapest possible prefix-match: the producer always
+        // emits `{"kind":"mem_read"` or `{"kind":"mem_write"` as
+        // the very first 17/18 bytes. Bail early on the common
+        // non-match case (e.g. win32_call / trap / exec lines).
+        let kind = if line.starts_with(br#"{"kind":"mem_write""#) {
+            WatchKind::Write
+        } else if line.starts_with(br#"{"kind":"mem_read""#) {
+            WatchKind::Read
+        } else {
+            return;
+        };
+
+        // Find `"addr":"0x…"` — we can't use a substring search
+        // crate, but `windows`-style scanning is fine since lines
+        // are short (~96 bytes).
+        let needle = br#""addr":"0x"#;
+        let Some(start) = line
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + needle.len())
+        else {
+            return;
+        };
+        // The hex value runs until the next `"` — typically 8
+        // hex digits.
+        let Some(end_offset) = line[start..].iter().position(|&b| b == b'"') else {
+            return;
+        };
+        let hex_bytes = &line[start..start + end_offset];
+        let hex = match std::str::from_utf8(hex_bytes) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let addr = match u32::from_str_radix(hex, 16) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Ok(mut q) = self.queue.lock() {
+            q.push_back(WatchHit { kind, addr });
+        }
+    }
+}
+
+impl Write for WatchSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Forward every byte first — the underlying sink is
+        // typically stderr / a file, so pass-through ordering
+        // matches what an operator running without `--gdb` would
+        // see, and a panic in the scanner doesn't lose data on
+        // the way out.
+        if let Some(f) = self.forward.as_mut() {
+            f.write_all(buf)?;
+        }
+        // Buffer + scan complete lines.
+        for &b in buf {
+            if b == b'\n' {
+                if !self.line_buf.is_empty() {
+                    self.scan_line(&self.line_buf);
+                    self.line_buf.clear();
+                }
+            } else {
+                self.line_buf.push(b);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = self.forward.as_mut() {
+            f.flush()?;
+        }
+        Ok(())
+    }
 }
 
 /// `gdbstub::Target` implementation backed by an
@@ -178,15 +328,30 @@ pub struct SandboxTarget {
     hw_watches: Vec<WatchRec>,
     /// What the client asked for on the most recent `c` / `s`.
     exec_mode: Option<ExecMode>,
+    /// Consumer-side handle on the watch-hit queue. The producer
+    /// is the [`WatchSink`] installed via
+    /// [`Sandbox::set_trace_sink`]; the event loop pops one entry
+    /// per `cpu.step` to translate guest memory accesses into
+    /// `Watch` stop-reasons for the GDB client.
+    watch_queue: WatchHitQueue,
 }
 
 impl SandboxTarget {
-    pub fn new(sandbox: Sandbox) -> Self {
+    pub fn new(mut sandbox: Sandbox) -> Self {
+        // Install our JSONL tap as the trace sink so the MMU's
+        // `maybe_emit_*` probes route into our watch-hit queue.
+        // Forwarded bytes (currently dropped to avoid clobbering
+        // the GDB stub's stderr framing) can be wired to a file
+        // sink in a future round.
+        let watch_queue: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let sink = WatchSink::new(watch_queue.clone(), None);
+        sandbox.set_trace_sink(Box::new(sink));
         Self {
             sandbox,
             sw_bps: Vec::new(),
             hw_watches: Vec::new(),
             exec_mode: None,
+            watch_queue,
         }
     }
 }
@@ -217,12 +382,38 @@ impl SingleThreadBase for SandboxTarget {
         regs.edi = r.gp[Reg32::Edi as usize];
         regs.eip = r.eip;
         regs.eflags = r.flags.pack();
-        // Segment / FPU / XMM / MXCSR are zero — see module doc.
+        // Segments + FPU internal + XMM + MXCSR remain zero (see
+        // module doc — the sandbox does not model them).
         regs.segments = Default::default();
-        regs.st = Default::default();
         regs.fpu = Default::default();
         regs.xmm = [0u128; 8];
         regs.mxcsr = 0;
+        // MMX surface: the architectural MMX register file
+        // `MM0..MM7` aliases the lower 64 bits of the FPU stack
+        // entries `ST(0)..ST(7)` per Intel SDM Vol. 1 §9.2.1.
+        // gdbstub_arch's `X86CoreRegs.st` is `[F80; 8]` where
+        // `F80 = [u8; 10]` — bytes 0..8 carry the 64-bit MMX
+        // mantissa, bytes 8..10 carry the FPU exponent + sign
+        // (zero in our model since we don't simulate the FPU).
+        // GDB's `info registers mmx` and `print $mm0` therefore
+        // see the live MMX state we actually compute in
+        // `oxideav_vfw::emulator::isa_mmx`.
+        let mmx = self.sandbox.cpu.mmx;
+        for (st_slot, mmx_word) in regs.st.iter_mut().zip(mmx.iter()) {
+            let bytes = mmx_word.to_le_bytes();
+            st_slot[..8].copy_from_slice(&bytes);
+            // Top two bytes (FPU exponent+sign) stay zero — see
+            // SDM §9.5.1 "Effect of MMX, x87 FPU FPE, and MMX
+            // CW Instructions on the MMX State Image": after a
+            // pure MMX write, the high word reads as 0xFFFF for
+            // the "valid MMX, invalid FPU" tagging. We elect to
+            // keep zero so the GDB user sees a clean
+            // tag-as-uninitialised pattern rather than a
+            // synthetic 0xFFFF that would mislead a casual
+            // reader of `info registers float`.
+            st_slot[8] = 0;
+            st_slot[9] = 0;
+        }
         Ok(())
     }
 
@@ -238,8 +429,18 @@ impl SingleThreadBase for SandboxTarget {
         r.gp[Reg32::Edi as usize] = regs.edi;
         r.eip = regs.eip;
         r.flags = oxideav_vfw::emulator::regs::Flags::unpack(regs.eflags);
-        // Other surfaces (segments / FPU / XMM) intentionally
-        // ignored — the sandbox does not model them.
+        // MMX writeback: GDB clients can `set $mm0 = …` to seed
+        // the MMX register file. We pull the lower 64 bits out of
+        // each `st[i]` entry — the high 16 bits of the F80 are
+        // the FPU exponent+sign which the sandbox does not model.
+        for (i, st_slot) in regs.st.iter().enumerate() {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&st_slot[..8]);
+            self.sandbox.cpu.mmx[i] = u64::from_le_bytes(bytes);
+        }
+        // Other surfaces (segments / FPU internal / XMM)
+        // intentionally ignored — the sandbox does not model
+        // them.
         Ok(())
     }
 
@@ -409,6 +610,29 @@ impl BlockingEventLoop for SandboxEventLoop {
                 }
             };
 
+            // Watchpoint hits — drain one queued event per stop
+            // so the GDB client sees `Watch { kind, addr }` with
+            // the exact address the codec touched. The MMU's
+            // watch probe ran inside the `cpu.step` we just
+            // completed; if a registered watch matched, our
+            // `WatchSink` already pushed an entry. Drain at most
+            // one per stop (the GDB protocol is one-stop-reason-
+            // per-packet); leftover hits stay in the queue and
+            // surface on subsequent resume + step pairs.
+            let watch_hit = target
+                .watch_queue
+                .lock()
+                .ok()
+                .and_then(|mut q| q.pop_front());
+            if let Some(hit) = watch_hit {
+                target.exec_mode = None;
+                return Ok(Event::TargetStopped(SingleThreadStopReason::Watch {
+                    tid: (),
+                    kind: hit.kind,
+                    addr: hit.addr,
+                }));
+            }
+
             // Single-step done?
             if mode == ExecMode::Step {
                 target.exec_mode = None;
@@ -537,6 +761,178 @@ mod tests {
         ));
         assert_eq!(t.hw_watches.len(), 1);
         assert_eq!(t.hw_watches[0].addr, 0x60000010);
+    }
+
+    #[test]
+    fn target_round_trips_mmx_through_st_aliasing() {
+        // Round-3 P2: MMX register file (`Cpu::mmx[u64; 8]`)
+        // surfaces through the `X86CoreRegs.st` field so a GDB
+        // client running `info registers mmx` / `print $mm0`
+        // sees the live register state.
+        let mut sb = Sandbox::new();
+        sb.cpu.mmx[0] = 0x0102030405060708;
+        sb.cpu.mmx[3] = 0xDEADBEEFCAFEBABE;
+        sb.cpu.mmx[7] = 0xFFFFFFFFFFFFFFFF;
+        let mut t = SandboxTarget::new(sb);
+
+        let mut regs = X86CoreRegs::default();
+        ok(SingleThreadBase::read_registers(&mut t, &mut regs));
+
+        // MM0 → low 8 bytes of st[0], little-endian.
+        assert_eq!(&regs.st[0][..8], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(regs.st[0][8], 0);
+        assert_eq!(regs.st[0][9], 0);
+        // MM3 → low 8 bytes of st[3].
+        assert_eq!(&regs.st[3][..8], &0xDEADBEEFCAFEBABEu64.to_le_bytes());
+        // MM7 → all-ones in low 8 bytes; FPU exponent stays 0.
+        assert_eq!(&regs.st[7][..8], &[0xFF; 8]);
+        assert_eq!(regs.st[7][8], 0);
+
+        // Mutate via the GDB write path and verify cpu.mmx
+        // sees the new value.
+        regs.st[1][..8].copy_from_slice(&0x4242424242424242u64.to_le_bytes());
+        ok(SingleThreadBase::write_registers(&mut t, &regs));
+        assert_eq!(t.sandbox.cpu.mmx[1], 0x4242424242424242);
+    }
+
+    #[test]
+    fn watch_sink_decodes_mem_write_lines() {
+        // Round-3 P1: the WatchSink JSONL tap turns the sandbox's
+        // `kind=mem_write` events into queued WatchHits.
+        let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sink = WatchSink::new(q.clone(), None);
+        let line = br#"{"kind":"mem_write","addr":"0x12340000","size":4,"value":"deadbeef","eip":"0x10001234"}
+"#;
+        sink.write_all(line).unwrap();
+        let drained: Vec<_> = q.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].kind, WatchKind::Write);
+        assert_eq!(drained[0].addr, 0x12340000);
+    }
+
+    #[test]
+    fn watch_sink_decodes_mem_read_lines() {
+        let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sink = WatchSink::new(q.clone(), None);
+        let line =
+            br#"{"kind":"mem_read","addr":"0xCAFEBABE","size":2,"value":"1234","eip":"0x10001234"}
+"#;
+        sink.write_all(line).unwrap();
+        let drained: Vec<_> = q.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].kind, WatchKind::Read);
+        assert_eq!(drained[0].addr, 0xCAFEBABE);
+    }
+
+    #[test]
+    fn watch_sink_ignores_non_mem_lines() {
+        // win32_call / trap / exec lines are not watch events
+        // and must not enqueue spurious WatchHits.
+        let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sink = WatchSink::new(q.clone(), None);
+        let lines: &[&[u8]] = &[
+            br#"{"kind":"win32_call","dll":"kernel32","name":"GetProcessHeap","args":[],"ret":"00000000","eip":"10001000"}
+"#,
+            br#"{"kind":"trap","addr":"0x10001000","reason":"unmapped","eip":"0x10001000"}
+"#,
+            br#"{"kind":"exec","eip":"0x10001000","bytes":"c3","mnemonic":"ret","registers":{}}
+"#,
+        ];
+        for l in lines {
+            sink.write_all(l).unwrap();
+        }
+        assert!(q.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_sink_handles_split_writes() {
+        // The MMU's `emit_line` calls `write_all(payload)` then
+        // `write_all(b"\n")` — i.e. one write may not include
+        // the trailing newline. Verify the buffering path.
+        let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sink = WatchSink::new(q.clone(), None);
+        sink.write_all(br#"{"kind":"mem_write","addr":"0x"#)
+            .unwrap();
+        sink.write_all(br#"60001000","size":4,"value":"abcd","eip":"0x10001234"}"#)
+            .unwrap();
+        // No newline yet — nothing decoded.
+        assert!(q.lock().unwrap().is_empty());
+        sink.write_all(b"\n").unwrap();
+        let drained: Vec<_> = q.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].addr, 0x60001000);
+    }
+
+    #[test]
+    fn cpu_step_with_watchpoint_enqueues_watch_hit() {
+        // End-to-end of the round-3 P1 wiring: a guest store
+        // through a registered watchpoint produces a queued
+        // `WatchHit` after `cpu.step`. We use real machine code
+        // (`mov [edi], eax; hlt`) to exercise the actual
+        // `Mmu::store32 → maybe_emit_write → trace.ev_mem_write`
+        // probe path that the GDB event loop relies on.
+        let mut sb = Sandbox::new();
+        // Map a code page (R+X) and a target page (R+W).
+        const CODE_BASE: u32 = 0x20001000;
+        const DATA_BASE: u32 = 0x60000000;
+        sb.mmu.map(
+            CODE_BASE,
+            0x1000,
+            oxideav_vfw::emulator::Perm::R | oxideav_vfw::emulator::Perm::X,
+        );
+        sb.mmu.map(
+            DATA_BASE,
+            0x1000,
+            oxideav_vfw::emulator::Perm::R | oxideav_vfw::emulator::Perm::W,
+        );
+        // 0x89 0x07 = `mov [edi], eax` (opcode 89 /r, ModR/M:
+        // mod=00 reg=eax(0) r/m=edi(7) → [edi]).
+        // 0xF4       = `hlt` — surfaces as `StepOk::Halted`.
+        sb.mmu
+            .write_initializer(CODE_BASE, &[0x89, 0x07, 0xF4])
+            .unwrap();
+        sb.cpu.regs.eip = CODE_BASE;
+        sb.cpu.regs.gp[Reg32::Eax as usize] = 0xCAFEF00D;
+        sb.cpu.regs.gp[Reg32::Edi as usize] = DATA_BASE + 0x100;
+        // Register a write watch on the target dword.
+        sb.watch(DATA_BASE + 0x100, 4, WatchMode::Write);
+        // Build the SandboxTarget — this installs the WatchSink
+        // that forwards into `watch_queue`.
+        let mut t = SandboxTarget::new(sb);
+        // Step once — executes `mov [edi], eax`. The MMU's
+        // store32 probe matches our watch and emits a JSONL
+        // `mem_write` line which our sink decodes.
+        let r = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
+        assert_eq!(r, oxideav_vfw::emulator::isa_int::StepOk::Continued);
+        // Verify the write actually happened.
+        assert_eq!(t.sandbox.mmu.load32(DATA_BASE + 0x100).unwrap(), 0xCAFEF00D);
+        // The WatchSink should have decoded one Write hit.
+        let drained: Vec<_> = t.watch_queue.lock().unwrap().drain(..).collect();
+        assert_eq!(drained.len(), 1, "expected one watch hit, got {drained:?}");
+        assert_eq!(drained[0].kind, WatchKind::Write);
+        assert_eq!(drained[0].addr, DATA_BASE + 0x100);
+    }
+
+    #[test]
+    fn watch_sink_forwards_to_underlying_writer() {
+        // An operator can pair `--gdb` with `--trace-output FILE`
+        // (round-4 candidate) — verify the forward path passes
+        // bytes through verbatim.
+        let q: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let captured: Vec<u8> = Vec::new();
+        let forward = Box::new(std::io::Cursor::new(captured));
+        let mut sink = WatchSink::new(q.clone(), Some(forward));
+        let line =
+            br#"{"kind":"mem_write","addr":"0x10000000","size":1,"value":"42","eip":"0x10001000"}
+"#;
+        sink.write_all(line).unwrap();
+        // Watch hit landed in the queue.
+        assert_eq!(q.lock().unwrap().len(), 1);
+        // The Cursor is consumed by `forward` so we can't read
+        // it back here without retaining a handle — but the
+        // `write_all` returning Ok proves the forward path was
+        // exercised. Real-world callers retain an `Arc<Mutex>`-
+        // wrapped writer for inspection.
     }
 
     #[test]

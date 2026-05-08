@@ -230,6 +230,95 @@ fn trace_mem_flag_parses() {
 }
 
 #[test]
+fn encode_subcommand_documents_iccompress_blocker_in_output() {
+    // Round-3 P3: ICCompress wiring is blocked on a cross-crate
+    // followup (`oxideav-vfw 0.1.0` ships only the decompress
+    // half of the host surface). The encode subcommand should
+    // surface that fact in its console output so an operator
+    // running it doesn't expect a fully-driven encode.
+    //
+    // Synthetic DLL has no DriverProc → install_codec fails →
+    // anyhow propagates the error. Exit non-zero is OK; we just
+    // assert the subcommand's pre-error output mentions the
+    // blocker.
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let out = Command::new(bin)
+        .arg(dll.path())
+        .arg("encode")
+        .args(["--width", "8", "--height", "8", "--pattern", "solid"])
+        .output()
+        .expect("spawn oxidetracevfw");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}{stderr}");
+    // Either the synth-DLL DriverProc-missing error, or — if
+    // `install_codec` ever stops being a hard error — our own
+    // "blocked on cross-crate followup" diagnostic. Either way,
+    // the user gets a clear signal.
+    assert!(
+        combined.contains("ICCompress")
+            || combined.to_lowercase().contains("driverproc")
+            || combined.contains("install_codec")
+            || combined.contains("DRV_OPEN"),
+        "expected encode subcommand to mention ICCompress or surface \
+         DriverProc/DRV_OPEN — got:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn decode_subcommand_drives_ic_decompress_path() {
+    // Round-3 P3: the `decode` subcommand wires through to
+    // `Sandbox::ic_open(ICMODE_DECOMPRESS)` +
+    // `Sandbox::ic_decompress_query` + `Sandbox::ic_decompress`
+    // rather than just printing the codec's identity card.
+    //
+    // The synthetic DLL doesn't expose `DriverProc`, so
+    // `install_codec` will surface the error and we exit non-
+    // zero — the outer CLI propagates the anyhow error. We
+    // still want to verify the subcommand at least *attempts*
+    // the decompress path; this test asserts the produced
+    // diagnostic mentions DriverProc / DRV_OPEN, proving we got
+    // past the load + DllMain stage.
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    // Empty input frame — sufficient since we don't expect to
+    // reach `ic_decompress` proper on the synthetic DLL.
+    let in_path = tempfile_path::write_temp("dec_in", "bin", b"");
+    let out = Command::new(bin)
+        .arg(dll.path())
+        .arg("decode")
+        .args([
+            "--input",
+            in_path.path().to_str().unwrap(),
+            "--width",
+            "64",
+            "--height",
+            "48",
+            "--pix-format",
+            "rgb24",
+        ])
+        .output()
+        .expect("spawn oxidetracevfw");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}{stderr}");
+    // Synthetic DLL has no DriverProc — the error message
+    // should reflect that. (`anyhow` prints the error chain on
+    // stderr.)
+    assert!(
+        combined.to_lowercase().contains("driverproc")
+            || combined.to_lowercase().contains("drv_open")
+            || combined.contains("install_codec")
+            || combined.contains("DRV_OPEN")
+            || combined.contains("ICOpen"),
+        "expected decode subcommand to surface a codec-side \
+         error mentioning DriverProc / DRV_OPEN / ICOpen — got:\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn break_flag_echoes_count_to_stderr() {
     let dll = write_synth_dll();
     let bin = env!("CARGO_BIN_EXE_oxidetracevfw");

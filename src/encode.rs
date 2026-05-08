@@ -1,13 +1,28 @@
 //! `encode` subcommand — drive the codec with a synthetic frame
 //! through the round-1 host-side surface.
 //!
-//! The full encoder pipeline lands when `oxideav-vfw` grows the
-//! `ICCompress` host-side wrapper (round 2 of this crate). For
-//! round 1 we accept the encode subcommand, generate the
-//! requested synthetic input, and report what the host's
-//! existing surface can do — primarily proving the path through
-//! `Sandbox::install_codec` + `ic_open` works for compress mode
-//! (`ICMODE_COMPRESS = 2`) on the operator's chosen DLL.
+//! ## Round 3 status — blocked on a cross-crate followup
+//!
+//! `oxideav-vfw 0.1.0` ships the decompress half of the VfW host
+//! surface (`ic_decompress_query` / `ic_decompress_begin` /
+//! `ic_decompress` / `ic_decompress_end`) but not the compress
+//! half. The encode subcommand therefore can only:
+//!
+//! 1. Verify the codec accepts `DRV_OPEN(ICMODE_COMPRESS = 2)`
+//!    (most legacy VfW codecs accept compress-mode open even when
+//!    they refuse the bitstream-format query later).
+//! 2. Generate the requested synthetic RGB24 input pattern.
+//! 3. Write the synthetic input out (proving the CLI plumbing).
+//!
+//! Round-4 candidate: when `oxideav-vfw` grows
+//! `Sandbox::ic_compress_query` / `ic_compress_begin` /
+//! `ic_compress` / `ic_compress_end` (mirroring the existing
+//! decompress wrappers + dispatching to `ICM_COMPRESS_QUERY` /
+//! `ICM_COMPRESS_BEGIN` / `ICM_COMPRESS` / `ICM_COMPRESS_END` —
+//! `vfw.h` macro values 0x4008 / 0x4001 / 0x4002 / 0x4007 in the
+//! Windows 10 SDK), the encode subcommand wires through the same
+//! pattern as `decode.rs`. Until then this path stays a
+//! synthetic-frame generator + open-only smoke test.
 
 use anyhow::{Context, Result};
 use oxideav_vfw::{Sandbox, DLL_PROCESS_ATTACH};
@@ -61,7 +76,9 @@ pub fn run(
 
     let synthetic = synth_pattern(width, height, pattern);
     println!(
-        "[encode] generated synthetic RGB24 input ({} bytes); ICCompress wiring lands in round 2 of this CLI",
+        "[encode] generated synthetic RGB24 input ({} bytes); ICCompress wiring blocked on \
+         a cross-crate followup — `oxideav-vfw 0.1.0` exposes `ic_decompress*` only, not \
+         `ic_compress*`. See the round-3 status note in src/encode.rs.",
         synthetic.len()
     );
 

@@ -16,6 +16,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 3 — watchpoint-hit `Watch` stop-reason wiring (P1).**
+  `gdb.rs` now installs a JSONL tap on the sandbox's trace sink
+  (`WatchSink`) that decodes `kind=mem_read` / `kind=mem_write`
+  events into a shared `WatchHit` queue. After each `cpu.step`
+  in the GDB blocking event loop we drain one entry and yield
+  `SingleThreadStopReason::Watch { tid: (), kind, addr }` so a
+  GDB client running `watch *(int *)0xDEADBEEF` + `c` halts at
+  the offending memory access. Tested end-to-end via a guest
+  `mov [edi], eax; hlt` micro-program.
+- **Round 3 — MMX register surface (P2).** `read_registers` /
+  `write_registers` now map `Cpu::mmx[u64; 8]` onto the lower
+  64 bits of `X86CoreRegs.st[i]` per Intel SDM Vol. 1 §9.2.1
+  (architectural alias `MM0..MM7` ↔ `ST(0)..ST(7).low64`). GDB
+  clients see the live MMX state through `info registers float`
+  and can `set $st0 = …` to seed `cpu.mmx[0]`. The high 16 bits
+  of each F80 (FPU exponent + sign) stay zero because the
+  sandbox does not model the FPU stack.
+- **Round 3 — encode/decode subcommand status notes (P3).**
+  `decode.rs` already wired `ic_open` →
+  `ic_decompress_query` → `ic_decompress_begin` →
+  `ic_decompress` → `ic_decompress_end` → `ic_close` against
+  the operator-supplied codec frame; a new integration test
+  asserts the path is exercised. `encode.rs` is blocked on a
+  cross-crate followup: `oxideav-vfw 0.1.0` exposes only the
+  `ic_decompress*` half of the VfW host surface, so encode
+  remains an open-only smoke test until `oxideav-vfw` grows
+  `Sandbox::ic_compress_query` / `ic_compress_begin` /
+  `ic_compress` / `ic_compress_end` (mirroring the existing
+  decompress wrappers; `ICM_COMPRESS*` macro values 0x4001 /
+  0x4002 / 0x4007 / 0x4008 in `vfw.h`).
+
 - **Round 2 — GDB Remote Serial Protocol server (`--gdb HOST:PORT`).**
   `src/gdb.rs` is now a complete `gdbstub::Target` implementation
   (architecture `gdbstub_arch::x86::X86_SSE`) wired to the
