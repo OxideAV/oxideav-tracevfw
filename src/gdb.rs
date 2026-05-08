@@ -51,6 +51,9 @@ use gdbstub::target::ext::breakpoints::{
     Breakpoints, BreakpointsOps, HwWatchpoint, HwWatchpointOps, SwBreakpoint, SwBreakpointOps,
     WatchKind,
 };
+use gdbstub::target::ext::target_description_xml_override::{
+    TargetDescriptionXmlOverride, TargetDescriptionXmlOverrideOps,
+};
 use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub_arch::x86::reg::id::X86CoreRegId;
 use gdbstub_arch::x86::reg::X86CoreRegs;
@@ -215,6 +218,99 @@ fn run_gdb_server_no_dll(addr: &str) -> Result<()> {
     let _ = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     Ok(())
 }
+
+/// Round-6 P2 — target description XML served on the
+/// `qXfer:features:read:target.xml:…` request.
+///
+/// Mirrors `gdb/features/i386/32bit-core.xml` + `32bit-sse.xml`
+/// from the GDB source tree (see
+/// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/i386-Features.html>),
+/// with the register order and bit widths matched exactly to the
+/// `gdbstub_arch::x86::X86_SSE` wire layout the stub sends in
+/// the `g`/`G` packets:
+///
+/// | bytes  | reg(s)               |
+/// |--------|----------------------|
+/// |   0..32| eax, ecx, edx, ebx,  |
+/// |        | esp, ebp, esi, edi   |
+/// |  32..36| eip                  |
+/// |  36..40| eflags               |
+/// |  40..64| cs, ss, ds, es, fs,  |
+/// |        | gs (each 32-bit)     |
+/// |  64..144| st0..st7 (each 80-bit)|
+/// | 144..176| fctrl, fstat, ftag, |
+/// |        | fiseg, fioff, foseg, |
+/// |        | fooff, fop (each 32) |
+/// | 176..304| xmm0..xmm7 (128-bit)|
+/// | 304..308| mxcsr               |
+///
+/// A GDB client that requests this description sees:
+///   - `org.gnu.gdb.i386.core` (24 regs through fop) — gives the
+///     client the canonical i386 layout it expects, including the
+///     ST(i) FPU stack we co-opt for MMX storage per Intel SDM
+///     Vol. 1 §9.2.1. With this in place, `info registers mmx`
+///     and `print $mm0` resolve correctly instead of "register
+///     not available" / wrong byte view.
+///   - `org.gnu.gdb.i386.sse` (xmm0..xmm7 + mxcsr) — sandbox
+///     does not model XMM but the wire layout reserves them, so
+///     advertising them keeps GDB's feature-detection happy.
+///
+/// Without this override, gdbstub falls back to a generic
+/// architecture description shipped inside `gdbstub_arch` that a
+/// GDB client may interpret with a slightly different register
+/// alignment — particularly around the MMX/ST aliasing — leading
+/// to mis-displayed register values in `info registers`.
+const TARGET_XML: &[u8] = br#"<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target version="1.0">
+  <architecture>i386</architecture>
+  <feature name="org.gnu.gdb.i386.core">
+    <reg name="eax" bitsize="32" type="int32"/>
+    <reg name="ecx" bitsize="32" type="int32"/>
+    <reg name="edx" bitsize="32" type="int32"/>
+    <reg name="ebx" bitsize="32" type="int32"/>
+    <reg name="esp" bitsize="32" type="data_ptr"/>
+    <reg name="ebp" bitsize="32" type="data_ptr"/>
+    <reg name="esi" bitsize="32" type="int32"/>
+    <reg name="edi" bitsize="32" type="int32"/>
+    <reg name="eip" bitsize="32" type="code_ptr"/>
+    <reg name="eflags" bitsize="32" type="int32"/>
+    <reg name="cs" bitsize="32" type="int32"/>
+    <reg name="ss" bitsize="32" type="int32"/>
+    <reg name="ds" bitsize="32" type="int32"/>
+    <reg name="es" bitsize="32" type="int32"/>
+    <reg name="fs" bitsize="32" type="int32"/>
+    <reg name="gs" bitsize="32" type="int32"/>
+    <reg name="st0" bitsize="80" type="i387_ext"/>
+    <reg name="st1" bitsize="80" type="i387_ext"/>
+    <reg name="st2" bitsize="80" type="i387_ext"/>
+    <reg name="st3" bitsize="80" type="i387_ext"/>
+    <reg name="st4" bitsize="80" type="i387_ext"/>
+    <reg name="st5" bitsize="80" type="i387_ext"/>
+    <reg name="st6" bitsize="80" type="i387_ext"/>
+    <reg name="st7" bitsize="80" type="i387_ext"/>
+    <reg name="fctrl" bitsize="32" type="int" group="float"/>
+    <reg name="fstat" bitsize="32" type="int" group="float"/>
+    <reg name="ftag" bitsize="32" type="int" group="float"/>
+    <reg name="fiseg" bitsize="32" type="int" group="float"/>
+    <reg name="fioff" bitsize="32" type="int" group="float"/>
+    <reg name="foseg" bitsize="32" type="int" group="float"/>
+    <reg name="fooff" bitsize="32" type="int" group="float"/>
+    <reg name="fop" bitsize="32" type="int" group="float"/>
+  </feature>
+  <feature name="org.gnu.gdb.i386.sse">
+    <reg name="xmm0" bitsize="128" type="vec128"/>
+    <reg name="xmm1" bitsize="128" type="vec128"/>
+    <reg name="xmm2" bitsize="128" type="vec128"/>
+    <reg name="xmm3" bitsize="128" type="vec128"/>
+    <reg name="xmm4" bitsize="128" type="vec128"/>
+    <reg name="xmm5" bitsize="128" type="vec128"/>
+    <reg name="xmm6" bitsize="128" type="vec128"/>
+    <reg name="xmm7" bitsize="128" type="vec128"/>
+    <reg name="mxcsr" bitsize="32" type="int" group="vector"/>
+  </feature>
+</target>
+"#;
 
 /// Single-step / continue intent set by the GDB resume packet.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -507,6 +603,25 @@ impl Target for SandboxTarget {
     fn support_breakpoints(&mut self) -> Option<BreakpointsOps<'_, Self>> {
         Some(self)
     }
+
+    /// Round-6 P2 — advertise the `qXfer:features:read` extension
+    /// so a connected GDB client can introspect our register
+    /// layout precisely, instead of falling back to the generic
+    /// X86_SSE description that ships with `gdbstub_arch` (which
+    /// would mis-describe the MMX surface — we alias `MM[i]` onto
+    /// `ST(i).low64` per Intel SDM Vol. 1 §9.2.1, which the canned
+    /// description doesn't advertise as a separate feature).
+    ///
+    /// The custom XML mirrors what `gdb/features/i386/32bit-core.xml`
+    /// plus `32bit-sse.xml` look like on a real i386 GDB build, with
+    /// the `org.gnu.gdb.i386.{core,sse}` feature names GDB clients
+    /// recognise as standard. See
+    /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/i386-Features.html>.
+    fn support_target_description_xml_override(
+        &mut self,
+    ) -> Option<TargetDescriptionXmlOverrideOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl SingleThreadBase for SandboxTarget {
@@ -747,6 +862,41 @@ impl SingleRegisterAccess<()> for SandboxTarget {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl TargetDescriptionXmlOverride for SandboxTarget {
+    /// Round-6 P2 — serve the static [`TARGET_XML`] payload to a
+    /// connected GDB client. `annex` is the requested document
+    /// name (the GDB protocol manual specifies `b"target.xml"` as
+    /// the root and allows `<xi:include>` to chain extra files —
+    /// our description is single-file so any non-`target.xml`
+    /// annex returns an empty body, which GDB treats as a
+    /// well-formed empty document).
+    fn target_description_xml(
+        &self,
+        annex: &[u8],
+        offset: u64,
+        length: usize,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        // Empty / unknown annex → empty document. The GDB protocol
+        // tolerates this; a client requesting `i386-something.xml`
+        // we don't ship just sees zero-length content.
+        if annex != b"target.xml" {
+            return Ok(0);
+        }
+        let total = TARGET_XML.len() as u64;
+        if offset >= total {
+            // Standard "end of stream" reply per the GDB protocol's
+            // qXfer pagination contract.
+            return Ok(0);
+        }
+        let start = offset as usize;
+        let remaining = TARGET_XML.len() - start;
+        let n = remaining.min(length).min(buf.len());
+        buf[..n].copy_from_slice(&TARGET_XML[start..start + n]);
+        Ok(n)
     }
 }
 
@@ -1568,5 +1718,94 @@ mod tests {
             s.contains(&format!("0x{BP_PC:08x}")),
             "expected breakpoint addr {BP_PC:08x} in JSONL, got: {s:?}"
         );
+    }
+
+    /// Round-6 P2 — `target.xml` annex returns the static
+    /// description payload, paginated. We assemble the full
+    /// document by walking `offset` until we get a 0-byte reply
+    /// and verify the canonical i386 feature-name strings + the
+    /// register names a GDB client expects. Without this
+    /// override, gdbstub falls back to a generic architecture
+    /// description that may mis-align our MMX-aliases-ST(i)
+    /// register surface.
+    #[test]
+    fn target_description_xml_serves_paginated_target_xml() {
+        let sb = Sandbox::new();
+        let t = SandboxTarget::new(sb);
+
+        let mut assembled = Vec::with_capacity(TARGET_XML.len());
+        let mut buf = [0u8; 256];
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok(t.target_description_xml(b"target.xml", offset, buf.len(), &mut buf));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(
+            assembled, TARGET_XML,
+            "paginated reads should reassemble the full document"
+        );
+        let s = std::str::from_utf8(&assembled).unwrap();
+        // Architecture marker + canonical GDB feature names.
+        assert!(s.contains("<architecture>i386</architecture>"));
+        assert!(s.contains(r#"name="org.gnu.gdb.i386.core""#));
+        assert!(s.contains(r#"name="org.gnu.gdb.i386.sse""#));
+        // Spot-check register names a GDB client introspects.
+        assert!(s.contains(r#"name="eax""#));
+        assert!(s.contains(r#"name="eip""#));
+        assert!(s.contains(r#"name="st0""#));
+        assert!(s.contains(r#"name="xmm0""#));
+        assert!(s.contains(r#"name="mxcsr""#));
+    }
+
+    /// Round-6 P2 — non-`target.xml` annex returns 0 (empty
+    /// document) — gdbstub treats this as a well-formed empty
+    /// reply rather than a protocol error. Real GDB clients only
+    /// follow `<xi:include>` references, so they don't request
+    /// arbitrary annexes.
+    #[test]
+    fn target_description_xml_unknown_annex_returns_empty() {
+        let sb = Sandbox::new();
+        let t = SandboxTarget::new(sb);
+        let mut buf = [0u8; 64];
+        let n = ok(t.target_description_xml(b"some-other-annex.xml", 0, buf.len(), &mut buf));
+        assert_eq!(n, 0, "unknown annex must return zero bytes");
+    }
+
+    /// Round-6 P2 — pagination `offset >= total_len` returns 0
+    /// (end-of-stream marker per the GDB qXfer pagination
+    /// contract).
+    #[test]
+    fn target_description_xml_offset_past_end_returns_empty() {
+        let sb = Sandbox::new();
+        let t = SandboxTarget::new(sb);
+        let mut buf = [0u8; 64];
+        let n = ok(t.target_description_xml(
+            b"target.xml",
+            TARGET_XML.len() as u64 + 100,
+            buf.len(),
+            &mut buf,
+        ));
+        assert_eq!(n, 0, "offset past EOF must return zero");
+    }
+
+    /// Round-6 P2 — single-shot read with a buffer larger than
+    /// the document returns the full document and zero on the
+    /// next call.
+    #[test]
+    fn target_description_xml_single_shot_returns_full_document() {
+        let sb = Sandbox::new();
+        let t = SandboxTarget::new(sb);
+        let mut buf = vec![0u8; TARGET_XML.len() + 1024];
+        let len = buf.len();
+        let n = ok(t.target_description_xml(b"target.xml", 0, len, &mut buf));
+        assert_eq!(n, TARGET_XML.len());
+        assert_eq!(&buf[..n], TARGET_XML);
+        // Subsequent read at offset == len returns 0.
+        let n2 = ok(t.target_description_xml(b"target.xml", n as u64, len, &mut buf));
+        assert_eq!(n2, 0);
     }
 }

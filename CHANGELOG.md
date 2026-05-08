@@ -6,6 +6,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 6 — `qXfer:features:read` register-description override (P2).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlOverride`,
+  advertised via `support_target_description_xml_override`. A connected
+  GDB client requesting `qXfer:features:read:target.xml:…` gets a
+  paginated read of a hand-rolled i386 description that matches the
+  `gdbstub_arch::x86::X86_SSE` wire layout exactly: GPRs + EIP +
+  EFLAGS + segment regs + ST(0..7) (which alias `MM(0..7)` per
+  Intel SDM Vol. 1 §9.2.1) + FPU internal regs + XMM(0..7) +
+  MXCSR. Without this override, gdbstub falls back to a generic
+  X86_SSE description that may mis-align our MMX-aliases-ST(i)
+  surface in `info registers`. Three new unit tests cover
+  paginated assembly, unknown-annex empty reply, and offset-past-EOF;
+  one new TCP-protocol integration test
+  (`qxfer_features_read_returns_target_xml_with_i386_features`)
+  drives the binary end-to-end and asserts the canonical
+  `org.gnu.gdb.i386.{core,sse}` feature names land in the assembled
+  document.
+- **Round 6 — real-codec smoke matrix (P1, opt-in).** New
+  `integration-real-codec` Cargo feature; `cargo test
+  --features integration-real-codec` fetches the canonical
+  Indeo Video 3 / 4 / 5 VfW codecs from
+  `samples.oxideav.org/codecs/windows/IV5PLAY/` (URLs +
+  SHA-256s pinned to the `docs/winmf/windows-codecs.md`
+  manifest), caches under `target/oxideav-tracevfw-fixtures/`,
+  drives `oxidetracevfw <fixture> probe --trace-output` against
+  each, and asserts exit code 0 plus at least one `kind=…` JSONL
+  event lands on disk. Off by default so the standard `cargo
+  test` flow stays self-contained; tests skip gracefully (with a
+  `[real-codec] skipped: …` stderr message) when curl is missing
+  or the network is unreachable. Fetcher uses the host's `curl`
+  binary instead of pulling a Rust HTTP client into
+  `[dev-dependencies]`; SHA-256 verification is implemented
+  inline (~80 LOC) so no `sha2` dev-dep either. Three fixture
+  tests (IR32_32.DLL / IR41_32.AX / IR50_32.DLL) plus one
+  FIPS 180-4 self-check on the standalone hash.
+
 ### Changed
 
 - `oxideav-vfw` dep bumped to `version = "0.1"` (was `"0.0"`).

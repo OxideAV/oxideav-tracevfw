@@ -25,6 +25,20 @@ anyhow = "1"
 gdbstub = "0.7"
 gdbstub_arch = "0.3"
 
+[features]
+# Round 6 P1 — opt-in integration tests that fetch real Windows
+# VfW codec fixtures (Indeo 3 / Indeo 4 / Indeo 5) from
+# `samples.oxideav.org` (under `codecs/windows/IV5PLAY/`) and
+# drive the binary against them. Off by default so the standard
+# `cargo test` flow stays fully self-contained — a CI host with
+# no outbound network still runs the synthetic-DLL tests
+# unchanged. When the feature is on, fetched binaries are cached
+# under `target/oxideav-tracevfw-fixtures/` and re-verified by
+# SHA-256 on every invocation; tests skip gracefully (printing a
+# `[real-codec] skipped` line) when the network or the cache
+# write path is unreachable.
+integration-real-codec = []
+
 [[bin]]
 name = "oxidetracevfw"
 path = "src/main.rs"
