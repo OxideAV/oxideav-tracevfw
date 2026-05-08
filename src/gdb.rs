@@ -53,6 +53,7 @@ use gdbstub::target::ext::breakpoints::{
     WatchKind,
 };
 use gdbstub::target::ext::exec_file::{ExecFile, ExecFileOps};
+use gdbstub::target::ext::libraries::{Libraries, LibrariesOps};
 use gdbstub::target::ext::memory_map::{MemoryMap, MemoryMapOps};
 use gdbstub::target::ext::target_description_xml_override::{
     TargetDescriptionXmlOverride, TargetDescriptionXmlOverrideOps,
@@ -556,6 +557,21 @@ pub struct SandboxTarget {
     /// `INDEO5.AX`, …) which is what an operator wants. Empty
     /// when no name was available.
     exec_file_name: String,
+    /// Round-8 P1 — `<library-list>` XML rendered from the
+    /// sandbox's loaded-module registry (`HostState::modules`)
+    /// at construction time, served paginated over
+    /// `qXfer:libraries:read`. One `<library>` element per
+    /// `(name, image_base)` entry, with a single `<segment>`
+    /// child whose `address` is the load base. Captures both
+    /// the primary codec DLL the operator passed on the CLI
+    /// AND every cascade-loaded module the kernel32 stubs
+    /// recorded during `DllMain` (e.g. `kernel32.dll` itself,
+    /// plus anything the codec pulled in via `LoadLibraryA`).
+    /// Empty (`""`) when no modules are loaded — the
+    /// `support_libraries` predicate is gated on non-empty so
+    /// gdbstub doesn't advertise the extension to a client
+    /// that would then mis-display the empty payload.
+    library_list_xml: String,
 }
 
 impl SandboxTarget {
@@ -618,6 +634,14 @@ impl SandboxTarget {
             Some(img) => Self::build_memory_map_xml(img),
             None => String::new(),
         };
+        // Render the `<library-list>` XML eagerly from the
+        // sandbox's loaded-module registry. After `Sandbox::load`
+        // + `call_dll_main` the registry contains the primary
+        // DLL plus every cascade-loaded module the kernel32 /
+        // user32 / gdi32 / vfw32 stubs registered. Empty when
+        // no modules are loaded yet (e.g. a non-PE blob that
+        // failed to load).
+        let library_list_xml = Self::build_library_list_xml(&sandbox);
         Self {
             sandbox,
             sw_bps: cli_bps.clone(),
@@ -628,6 +652,7 @@ impl SandboxTarget {
             forward,
             memory_map_xml,
             exec_file_name,
+            library_list_xml,
         }
     }
 
@@ -688,6 +713,72 @@ impl SandboxTarget {
             ));
         }
         s.push_str("</memory-map>\n");
+        s
+    }
+
+    /// Render a GDB `<library-list>` XML document describing
+    /// every module currently registered in the sandbox's
+    /// `HostState::modules` map. Each entry becomes a
+    /// `<library name="…"><segment address="0x…"/></library>`
+    /// element, where `name` is the original case-folded module
+    /// key (`kernel32.dll`, `synth.dll`, `ir50_32.dll`, …) and
+    /// `address` is the load-base the loader assigned (the same
+    /// value `LoadLibraryA` / `GetModuleHandleA` would return
+    /// for that name).
+    ///
+    /// The schema follows the GDB protocol manual's "Library
+    /// List Format" §, with the segment-style child preferred
+    /// over `<section>` because a PE image's segment-equivalent
+    /// (the `image_base`) is one stable address, whereas
+    /// reproducing every PE section as a `<section>` would
+    /// duplicate the `qXfer:memory-map:read` payload (round 7).
+    /// See <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Library-List-Format.html>.
+    ///
+    /// XML attribute escaping is minimal — module names are
+    /// canonicalised to lowercase ASCII by the loader so they
+    /// don't contain `<` / `>` / `&` / `"`. Defensive escaping
+    /// is still applied for robustness (e.g. in case a future
+    /// codec passes a path-style name through `LoadLibraryA`).
+    ///
+    /// Returns `String::new()` when no modules are registered;
+    /// the `support_libraries` predicate is gated on this so
+    /// gdbstub doesn't advertise an extension we'd answer with
+    /// an empty payload.
+    fn build_library_list_xml(sandbox: &Sandbox) -> String {
+        let modules = &sandbox.host.modules;
+        if modules.is_empty() {
+            return String::new();
+        }
+        let mut s = String::with_capacity(96 + modules.len() * 80);
+        s.push_str("<?xml version=\"1.0\"?>\n");
+        s.push_str("<library-list version=\"1.0\">\n");
+        for (name, base) in modules.iter() {
+            // XML attribute-value escaping for the five reserved
+            // characters: `<` / `>` / `&` / `"` / `'`. Module
+            // names are lowercase ASCII in practice, but be
+            // defensive — a malformed `LoadLibraryA` argument
+            // could otherwise corrupt the document.
+            let mut safe = String::with_capacity(name.len());
+            for c in name.chars() {
+                match c {
+                    '<' => safe.push_str("&lt;"),
+                    '>' => safe.push_str("&gt;"),
+                    '&' => safe.push_str("&amp;"),
+                    '"' => safe.push_str("&quot;"),
+                    '\'' => safe.push_str("&apos;"),
+                    c if c.is_ascii_graphic() || c == ' ' => safe.push(c),
+                    // Drop unprintable characters silently —
+                    // attribute values can't carry them.
+                    _ => {}
+                }
+            }
+            s.push_str("  <library name=\"");
+            s.push_str(&safe);
+            s.push_str("\"><segment address=\"0x");
+            s.push_str(&format!("{base:08x}"));
+            s.push_str("\"/></library>\n");
+        }
+        s.push_str("</library-list>\n");
         s
     }
 
@@ -776,6 +867,37 @@ impl Target for SandboxTarget {
     /// returning an empty string the client might mis-display.
     fn support_exec_file(&mut self) -> Option<ExecFileOps<'_, Self>> {
         if self.exec_file_name.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    /// Round-8 P1 — advertise `qXfer:libraries:read` so a
+    /// connected GDB client's `info sharedlibrary` shows the
+    /// loaded-module registry the codec built up during
+    /// `DllMain` (the primary DLL the operator passed on the
+    /// CLI plus every cascade-loaded module the kernel32 /
+    /// user32 / gdi32 / vfw32 stubs registered while the codec
+    /// pulled in its dependencies via `LoadLibraryA`).
+    ///
+    /// Many VfW codec DLLs cascade-load other system DLLs at
+    /// runtime — `mpg4c32` typically pulls in `msacm32.dll`
+    /// for codec configuration UI, `IR50_32.DLL` calls
+    /// `LoadLibraryA("INDEO5.DLL")` to delegate to its
+    /// helper module, etc. Surfacing the full list lets a GDB
+    /// client step into those cascade-loaded modules and
+    /// inspect their address ranges without hand-crafting a
+    /// `add-symbol-file <path> <base>` command per cascade.
+    ///
+    /// Returns `None` when the registry is empty (e.g. operator
+    /// passed a non-PE blob that failed to load) so gdbstub can
+    /// report "unsupported" cleanly rather than serving an empty
+    /// payload a client might mis-display. See
+    /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Library-List-Format.html>
+    /// for the schema.
+    fn support_libraries(&mut self) -> Option<LibrariesOps<'_, Self>> {
+        if self.library_list_xml.is_empty() {
             None
         } else {
             Some(self)
@@ -1080,6 +1202,35 @@ impl MemoryMap for SandboxTarget {
             return Ok(0);
         }
         let bytes = self.memory_map_xml.as_bytes();
+        let start = offset as usize;
+        let remaining = bytes.len() - start;
+        let n = remaining.min(length).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl Libraries for SandboxTarget {
+    /// Round-8 P1 — serve the pre-rendered `<library-list>` XML
+    /// document over the `qXfer:libraries:read` paginated
+    /// transfer. The document was assembled at construction
+    /// time from the sandbox's `HostState::modules` map (see
+    /// [`SandboxTarget::build_library_list_xml`]) so per-chunk
+    /// reads are a flat byte-slice walk. Pagination matches the
+    /// GDB qXfer contract — `offset` past the end returns `0`
+    /// (gdbstub frames this as the `l<empty>` end-of-stream
+    /// reply).
+    fn get_libraries(
+        &self,
+        offset: u64,
+        length: usize,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        let bytes = self.library_list_xml.as_bytes();
+        let total = bytes.len() as u64;
+        if offset >= total {
+            return Ok(0);
+        }
         let start = offset as usize;
         let remaining = bytes.len() - start;
         let n = remaining.min(length).min(buf.len());
@@ -2251,5 +2402,209 @@ mod tests {
         assert_eq!(section_memory_kind(&mk(Perm::R | Perm::X)), "rom");
         assert_eq!(section_memory_kind(&mk(Perm::R | Perm::W)), "ram");
         assert_eq!(section_memory_kind(&mk(Perm::R | Perm::W | Perm::X)), "ram");
+    }
+
+    /// Round-8 P1 — `build_library_list_xml` walks the sandbox's
+    /// loaded-module registry and produces a well-formed GDB
+    /// `<library-list>` document. We seed three entries with
+    /// distinct image bases (the synthetic loader inserts the
+    /// primary DLL keyed lowercase; we add cascade-loaded
+    /// modules manually to mirror what `kernel32!LoadLibraryA`
+    /// would do during `DllMain`).
+    #[test]
+    fn build_library_list_xml_contains_all_modules() {
+        let mut sb = Sandbox::new();
+        // Mirror the production loader's insertion shape:
+        // lowercase ASCII name → image_base.
+        sb.host.modules.insert("synth.dll".into(), 0x1000_0000);
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        sb.host.modules.insert("indeo5.dll".into(), 0x6800_0000);
+
+        let xml = SandboxTarget::build_library_list_xml(&sb);
+
+        // Canonical document boundaries.
+        assert!(
+            xml.starts_with("<?xml version=\"1.0\"?>"),
+            "missing XML prologue: {xml:?}"
+        );
+        assert!(
+            xml.contains("<library-list version=\"1.0\">"),
+            "missing <library-list> root with version: {xml:?}"
+        );
+        assert!(
+            xml.trim_end().ends_with("</library-list>"),
+            "missing </library-list> closing tag: {xml:?}"
+        );
+
+        // Each module surfaces as a <library> with one segment.
+        // The primary DLL's image base + names land in the doc.
+        assert!(
+            xml.contains(r#"<library name="synth.dll">"#),
+            "missing synth.dll entry: {xml:?}"
+        );
+        assert!(
+            xml.contains(r#"<library name="kernel32.dll">"#),
+            "missing kernel32.dll entry: {xml:?}"
+        );
+        assert!(
+            xml.contains(r#"<library name="indeo5.dll">"#),
+            "missing indeo5.dll entry: {xml:?}"
+        );
+        // Image bases land inside <segment address="0x…"/>.
+        assert!(
+            xml.contains(r#"<segment address="0x10000000"/>"#),
+            "missing synth.dll segment: {xml:?}"
+        );
+        assert!(
+            xml.contains(r#"<segment address="0x77000000"/>"#),
+            "missing kernel32.dll segment: {xml:?}"
+        );
+        assert!(
+            xml.contains(r#"<segment address="0x68000000"/>"#),
+            "missing indeo5.dll segment: {xml:?}"
+        );
+    }
+
+    /// Round-8 P1 — `build_library_list_xml` returns the empty
+    /// string when no modules are registered. The
+    /// `support_libraries` predicate uses this to refuse to
+    /// advertise the extension to a client that would otherwise
+    /// see an empty payload.
+    #[test]
+    fn build_library_list_xml_empty_for_empty_registry() {
+        let sb = Sandbox::new();
+        // Fresh `Sandbox::new` doesn't load anything, so the
+        // module map starts empty.
+        assert!(sb.host.modules.is_empty());
+        let xml = SandboxTarget::build_library_list_xml(&sb);
+        assert!(
+            xml.is_empty(),
+            "expected empty XML for empty registry, got: {xml:?}"
+        );
+    }
+
+    /// Round-8 P1 — `build_library_list_xml` escapes XML
+    /// reserved characters in module names so a malformed
+    /// `LoadLibraryA` argument can't corrupt the document.
+    #[test]
+    fn build_library_list_xml_escapes_attribute_specials() {
+        let mut sb = Sandbox::new();
+        sb.host
+            .modules
+            .insert(r#"weird<&">.dll"#.into(), 0x4000_0000);
+        let xml = SandboxTarget::build_library_list_xml(&sb);
+        // None of the raw `<` / `&` / `"` (other than the ones
+        // delimiting attributes themselves) survive into the
+        // `name=` attribute value.
+        assert!(xml.contains("&lt;"), "expected &lt; escape, got: {xml:?}");
+        assert!(xml.contains("&amp;"), "expected &amp; escape, got: {xml:?}");
+        assert!(
+            xml.contains("&quot;"),
+            "expected &quot; escape, got: {xml:?}"
+        );
+        // The escaped form should not include a stray un-escaped
+        // double-quote between the `name="` and `">` boundaries.
+        // We extract the substring inside `name="…"` and check it.
+        let attr_start = xml.find(r#"name=""#).unwrap() + r#"name=""#.len();
+        let attr_end = xml[attr_start..]
+            .find(r#"">"#)
+            .map(|p| attr_start + p)
+            .expect("attribute terminator");
+        let attr = &xml[attr_start..attr_end];
+        assert!(
+            !attr.contains('"'),
+            "attribute body should not contain raw quotes: {attr:?}"
+        );
+        assert!(
+            !attr.contains('<'),
+            "attribute body should not contain raw <: {attr:?}"
+        );
+    }
+
+    /// Round-8 P1 — `support_libraries` returns `Some` when the
+    /// registry is non-empty and `None` when empty, matching
+    /// the contract of the round-7 `support_memory_map` /
+    /// `support_exec_file` predicates: don't advertise a qXfer
+    /// extension we'd answer with an empty payload.
+    #[test]
+    fn support_libraries_gated_on_registry_population() {
+        // Empty registry — extension unavailable.
+        let mut t_empty = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_libraries(&mut t_empty).is_none());
+
+        // Registry populated via the synthetic-DLL load path —
+        // extension wired.
+        let (sb, _img) = synth_sandbox_with_image();
+        let mut t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+        );
+        assert!(Target::support_libraries(&mut t).is_some());
+    }
+
+    /// Round-8 P1 — `qXfer:libraries:read` paginates the rendered
+    /// XML correctly: assembling chunks of arbitrary length
+    /// yields the full document, offset-past-end returns 0.
+    #[test]
+    fn libraries_xml_paginates_correctly() {
+        let (sb, _img) = synth_sandbox_with_image();
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+        );
+
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 24];
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok(Libraries::get_libraries(&t, offset, buf.len(), &mut buf));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(assembled.as_slice(), t.library_list_xml.as_bytes());
+
+        // Past-EOF read returns 0.
+        let mut buf2 = [0u8; 32];
+        let n = ok(Libraries::get_libraries(
+            &t,
+            t.library_list_xml.len() as u64 + 100,
+            buf2.len(),
+            &mut buf2,
+        ));
+        assert_eq!(n, 0);
+    }
+
+    /// Round-8 P1 — after the synthetic DLL is loaded, the
+    /// `<library-list>` document references the DLL's lowercase
+    /// name + its image-base segment. `pe::test_image::build_minimal_dll`
+    /// fixes the image_base at 0x10000000.
+    #[test]
+    fn libraries_xml_contains_synth_dll_entry_after_load() {
+        let (sb, _img) = synth_sandbox_with_image();
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+        );
+        let xml = &t.library_list_xml;
+        assert!(
+            xml.contains(r#"<library name="synth.dll">"#),
+            "expected synth.dll library entry, got: {xml:?}"
+        );
+        assert!(
+            xml.contains(r#"<segment address="0x10000000"/>"#),
+            "expected synth.dll image-base segment, got: {xml:?}"
+        );
     }
 }

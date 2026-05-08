@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 8 — `qXfer:libraries:read` loaded-module registry (P1).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::libraries::Libraries`, advertised via
+  `support_libraries`. The `<library-list version="1.0">` XML
+  document is rendered eagerly at `with_forward` construction time
+  from the sandbox's `oxideav_vfw::win32::HostState::modules`
+  registry (name → ImageBase). Each entry becomes a
+  `<library name="…"><segment address="0x…"/></library>` element,
+  matching the GDB Library List Format §
+  (<https://sourceware.org/gdb/current/onlinedocs/gdb.html/Library-List-Format.html>).
+  After `Sandbox::load` + `call_dll_main` the registry contains
+  the primary DLL plus every cascade-loaded module the
+  kernel32 / user32 / gdi32 / vfw32 stubs registered while the
+  codec pulled in its dependencies via `LoadLibraryA` — many
+  VfW codec DLLs cascade-load other system DLLs at runtime
+  (`mpg4c32` → `msacm32.dll`, `IR50_32.DLL` → `INDEO5.DLL`,
+  …). A connected GDB client's `info sharedlibrary` now shows
+  the full list instead of "no libraries". XML attribute
+  escaping covers the five reserved characters
+  (`<` / `>` / `&` / `"` / `'`) defensively in case a future
+  codec passes a path-style name through `LoadLibraryA`.
+  Six unit tests cover the XML builder, the empty-registry
+  short-circuit, attribute escaping, the gating predicate,
+  pagination, and the post-load synthetic-DLL surface; one
+  TCP-protocol integration test
+  (`qxfer_libraries_read_returns_module_registry`) drives the
+  binary end-to-end and asserts on the assembled document
+  containing the synth DLL's lowercase basename + its
+  `image_base = 0x10000000` segment.
+
 - **Round 7 — `qXfer:memory-map:read` PE section table (P1).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::memory_map::MemoryMap`, advertised via

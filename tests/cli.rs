@@ -1423,6 +1423,194 @@ fn qxfer_exec_file_read_returns_dll_basename() {
     let _ = child.wait();
 }
 
+/// Round-8 P1 — `qXfer:libraries:read` returns a GDB-format
+/// `<library-list>` document populated from the sandbox's
+/// loaded-module registry. Connected GDB clients use this for
+/// `info sharedlibrary` and to step into cascade-loaded modules.
+/// A real codec like `mpg4c32` typically pulls in `msacm32.dll`
+/// plus `winmm.dll` during DllMain — this extension surfaces
+/// those to the client. The test asserts:
+///
+/// 1. `qSupported` reply contains `qXfer:libraries:read+`,
+/// 2. paginated `qXfer:libraries:read::<offset>,<length>` reads
+///    reassemble into a well-formed `<library-list version="1.0">`
+///    document,
+/// 3. the document references the synthetic DLL's basename
+///    and its image base (`pe::test_image::build_minimal_dll`
+///    pins image_base = 0x10000000).
+#[test]
+fn qxfer_libraries_read_returns_module_registry() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // 1. qSupported handshake — gdbstub only enables
+    //    `qXfer:libraries:read+` in the response when both ends
+    //    advertise support.
+    sock.write_all(&rsp_packet(
+        "qSupported:multiprocess+;swbreak+;hwbreak+;qXfer:libraries:read+",
+    ))
+    .expect("write qSupported");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.contains("qXfer:libraries:read+"),
+        "expected qXfer:libraries:read+ in qSupported reply, got: {resp:?}"
+    );
+
+    // 2. Paginated read of the libraries document. The annex is
+    //    empty for libraries (`qXfer:libraries:read::offset,length`).
+    let mut assembled = String::new();
+    let mut offset: u64 = 0;
+    let chunk_len: u64 = 128;
+    loop {
+        let pkt = format!("qXfer:libraries:read::{offset:x},{chunk_len:x}");
+        sock.write_all(&rsp_packet(&pkt)).expect("write qXfer");
+        let resp = read_packet(&mut sock);
+        if resp.is_empty() {
+            panic!("qXfer:libraries:read returned empty (extension not advertised)");
+        }
+        let last = resp.starts_with('l');
+        let data = &resp[1..];
+        // RLE expansion — `*N` repeats the previous char (N - 29).
+        let bytes = data.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '*' && i + 1 < bytes.len() && !assembled.is_empty() {
+                let n = bytes[i + 1] as i32 - 29;
+                let last_ch = assembled.chars().last().unwrap();
+                for _ in 0..n {
+                    assembled.push(last_ch);
+                }
+                i += 2;
+            } else {
+                assembled.push(c);
+                i += 1;
+            }
+        }
+        offset = assembled.len() as u64;
+        if last {
+            break;
+        }
+        if offset > 100_000 {
+            panic!("runaway qXfer pagination — assembled {offset} bytes");
+        }
+    }
+
+    // 3. Sanity-check the document.
+    assert!(
+        assembled.starts_with("<?xml version=\"1.0\"?>"),
+        "missing XML prologue, got: {assembled:?}"
+    );
+    assert!(
+        assembled.contains(r#"<library-list version="1.0">"#),
+        "missing <library-list> root with version, got: {assembled:?}"
+    );
+    assert!(
+        assembled.contains("</library-list>"),
+        "missing </library-list> closing tag, got: {assembled:?}"
+    );
+    // The synthetic DLL's basename gets keyed lowercase by the
+    // PE loader (`name.to_ascii_lowercase()`); the helper writes
+    // a temp file with prefix `synth_dll-…` — so the lowercase
+    // name surfaces in the registry entry.
+    assert!(
+        assembled.contains("<library name=\"synth_dll-"),
+        "missing synth DLL library entry, got: {assembled:?}"
+    );
+    // `pe::test_image::build_minimal_dll` pins image_base at
+    // 0x10000000 — the segment address in the document should
+    // match.
+    assert!(
+        assembled.contains(r#"<segment address="0x10000000"/>"#),
+        "missing image-base segment, got: {assembled:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
 /// Tiny helper namespace — temp-file path with auto-delete on
 /// drop. We avoid pulling `tempfile` as a dev-dep purely to
 /// keep this crate's dependency tree light; this is ~30 LOC.
