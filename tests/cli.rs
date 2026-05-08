@@ -1070,6 +1070,359 @@ fn qxfer_features_read_returns_target_xml_with_i386_features() {
     let _ = child.wait();
 }
 
+/// Round-7 P1 — `qXfer:memory-map:read` returns a GDB-DTD
+/// memory-map document populated from the loaded PE image's
+/// section table. Connected GDB clients use this for
+/// `info mem` / `maintenance info sections`. The test asserts:
+///   1. `qSupported` reply now contains `qXfer:memory-map:read+`,
+///   2. paginated `qXfer:memory-map:read::<offset>,<length>`
+///      reads reassemble into a well-formed `<memory-map>` document,
+///   3. the document references the synthetic DLL's `.text`
+///      section (mapped at `image_base + 0x1000` per
+///      `pe::test_image::build_minimal_dll`).
+#[test]
+fn qxfer_memory_map_read_returns_section_table() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // 1. qSupported handshake — clients advertise what they want;
+    //    gdbstub only enables `qXfer:memory-map:read+` in the
+    //    response if both ends agree.
+    sock.write_all(&rsp_packet(
+        "qSupported:multiprocess+;swbreak+;hwbreak+;qXfer:memory-map:read+",
+    ))
+    .expect("write qSupported");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.contains("qXfer:memory-map:read+"),
+        "expected qXfer:memory-map:read+ in qSupported reply, got: {resp:?}"
+    );
+
+    // 2. Paginated read of the memory-map document. The annex is
+    //    empty for memory-map (the GDB protocol leaves the slot
+    //    blank for `qXfer:memory-map:read::offset,length`).
+    let mut assembled = String::new();
+    let mut offset: u64 = 0;
+    let chunk_len: u64 = 256;
+    loop {
+        let pkt = format!("qXfer:memory-map:read::{offset:x},{chunk_len:x}");
+        sock.write_all(&rsp_packet(&pkt)).expect("write qXfer");
+        let resp = read_packet(&mut sock);
+        if resp.is_empty() {
+            panic!("qXfer:memory-map:read returned empty (extension not advertised)");
+        }
+        let last = resp.starts_with('l');
+        let data = &resp[1..];
+        // Expand qXfer's RLE compression (`*N` = repeat last char).
+        let bytes = data.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '*' && i + 1 < bytes.len() && !assembled.is_empty() {
+                let n = bytes[i + 1] as i32 - 29;
+                let last_ch = assembled.chars().last().unwrap();
+                for _ in 0..n {
+                    assembled.push(last_ch);
+                }
+                i += 2;
+            } else {
+                assembled.push(c);
+                i += 1;
+            }
+        }
+        offset = assembled.len() as u64;
+        if last {
+            break;
+        }
+        if offset > 200_000 {
+            panic!("runaway qXfer pagination — assembled {offset} bytes");
+        }
+    }
+
+    // 3. Sanity-check the document.
+    assert!(
+        assembled.starts_with("<?xml version=\"1.0\"?>"),
+        "missing XML prologue, got: {assembled:?}"
+    );
+    assert!(
+        assembled.contains("<memory-map>"),
+        "missing root element, got: {assembled:?}"
+    );
+    // The synthetic DLL maps `.text` at `image_base + 0x1000`. The
+    // `build_minimal_dll` helper uses image_base = 0x10000000 (see
+    // `oxideav_vfw::pe::test_image`). We assert on the .text VA.
+    assert!(
+        assembled.contains("0x10001000"),
+        "missing .text VA in memory-map, got: {assembled:?}"
+    );
+    // At least one rom-typed section (.text is read-execute, never
+    // writable).
+    assert!(
+        assembled.contains(r#"type="rom""#),
+        "expected at least one rom section, got: {assembled:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
+/// Round-7 P2 — `qXfer:exec-file:read` returns the codec's
+/// basename so a connected GDB client's `info file` shows
+/// `synth_dll-…dll` rather than the placeholder
+/// `<process N>` gdbstub falls back to. The test asserts:
+///   1. `qSupported` reply contains `qXfer:exec-file:read+`,
+///   2. paginated read reassembles to a string ending in `.dll`
+///      (the operator-supplied DLL filename — the `tempfile`
+///      helper appends a unique suffix so we don't pin to an
+///      exact basename).
+#[test]
+fn qxfer_exec_file_read_returns_dll_basename() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let dll_basename = dll
+        .path()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .expect("temp file has basename");
+
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    // 1. qSupported handshake — exec-file extension is gated on
+    //    both ends advertising support.
+    sock.write_all(&rsp_packet(
+        "qSupported:multiprocess+;swbreak+;hwbreak+;qXfer:exec-file:read+",
+    ))
+    .expect("write qSupported");
+    let resp = read_packet(&mut sock);
+    assert!(
+        resp.contains("qXfer:exec-file:read+"),
+        "expected qXfer:exec-file:read+ in qSupported reply, got: {resp:?}"
+    );
+
+    // 2. Paginated read — the exec-file annex carries the pid; we
+    //    leave it empty (== current process) and read the whole
+    //    name. Real GDB clients also send the pid as a hex string,
+    //    but the empty-annex path is well-defined per the GDB
+    //    protocol manual §"qXfer:exec-file:read".
+    let mut assembled = String::new();
+    let mut offset: u64 = 0;
+    let chunk_len: u64 = 64;
+    loop {
+        let pkt = format!("qXfer:exec-file:read::{offset:x},{chunk_len:x}");
+        sock.write_all(&rsp_packet(&pkt)).expect("write qXfer");
+        let resp = read_packet(&mut sock);
+        if resp.is_empty() {
+            panic!("qXfer:exec-file:read returned empty (extension not advertised)");
+        }
+        let last = resp.starts_with('l');
+        let data = &resp[1..];
+        // RLE expansion — exec-file payloads are short so this is
+        // mostly a no-op, but we keep parity with the other qXfer
+        // readers.
+        let bytes = data.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c == '*' && i + 1 < bytes.len() && !assembled.is_empty() {
+                let n = bytes[i + 1] as i32 - 29;
+                let last_ch = assembled.chars().last().unwrap();
+                for _ in 0..n {
+                    assembled.push(last_ch);
+                }
+                i += 2;
+            } else {
+                assembled.push(c);
+                i += 1;
+            }
+        }
+        offset = assembled.len() as u64;
+        if last {
+            break;
+        }
+        if offset > 4096 {
+            panic!("runaway exec-file pagination — assembled {offset} bytes");
+        }
+    }
+
+    // 3. The reassembled string is the temp-file basename the
+    //    helper generated (a suffix-randomised string ending in
+    //    `.dll`).
+    assert_eq!(
+        assembled, dll_basename,
+        "exec-file payload should match DLL basename"
+    );
+    assert!(
+        assembled.ends_with(".dll"),
+        "expected .dll suffix in exec-file payload, got: {assembled:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
 /// Tiny helper namespace — temp-file path with auto-delete on
 /// drop. We avoid pulling `tempfile` as a dev-dep purely to
 /// keep this crate's dependency tree light; this is ~30 LOC.

@@ -8,6 +8,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 7 — `qXfer:memory-map:read` PE section table (P1).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::memory_map::MemoryMap`, advertised via
+  `support_memory_map`. The XML document is rendered eagerly at
+  `with_forward` construction time from the loaded
+  `oxideav_vfw::pe::Image::sections` table — each PE section
+  becomes a `<memory>` element with `start = va_start`,
+  `length = mapped_size`, and `type = "rom"` (read-only or
+  read-execute) or `"ram"` (writable), per the GDB memory-map
+  DTD (only `ram` / `rom` / `flash` are admitted; see
+  <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Memory-Map-Format.html>).
+  A connected GDB client's `info mem` /
+  `maintenance info sections` now shows the codec's actual
+  loaded layout (`.text` r-x at `image_base + 0x1000`, `.data`
+  rw-, `.rdata` r--, …) instead of "no memory regions". Three
+  unit tests cover the XML builder + the gating predicate +
+  pagination; one TCP-protocol integration test
+  (`qxfer_memory_map_read_returns_section_table`) drives the
+  binary end-to-end and asserts on the assembled document
+  containing `.text`'s VA + at least one rom-typed section.
+- **Round 7 — `qXfer:exec-file:read` codec basename (P2).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::exec_file::ExecFile`, advertised via
+  `support_exec_file`. The DLL/AX filename the operator passed
+  on the CLI is captured at construction time and returned to
+  the GDB client across paginated `qXfer:exec-file:read::…`
+  reads — so `info file` shows `IR32_32.DLL` / `INDEO5.AX` /
+  the operator's actual basename instead of the placeholder
+  `<process N>` gdbstub falls back to. The path is intentionally
+  stripped to a basename so we don't leak the host filesystem
+  layout to the wire. Two unit tests cover the gating predicate
+  + paginated reads + `pid`-ignoring contract; one
+  TCP-protocol integration test
+  (`qxfer_exec_file_read_returns_dll_basename`) drives the
+  binary end-to-end and asserts the reassembled string matches
+  the temp-file's `.dll` basename exactly.
+
 - **Round 6 — `qXfer:features:read` register-description override (P2).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::target_description_xml_override::TargetDescriptionXmlOverride`,

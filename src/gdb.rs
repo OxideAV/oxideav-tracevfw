@@ -35,6 +35,7 @@
 //! - `gdbstub_arch::x86::X86_SSE`: <https://docs.rs/gdbstub_arch/0.3>
 
 use anyhow::{Context, Result};
+use gdbstub::common::Pid;
 use gdbstub::common::Signal;
 use gdbstub::conn::{Connection, ConnectionExt};
 use gdbstub::stub::run_blocking::{BlockingEventLoop, Event, WaitForStopReasonError};
@@ -51,6 +52,8 @@ use gdbstub::target::ext::breakpoints::{
     Breakpoints, BreakpointsOps, HwWatchpoint, HwWatchpointOps, SwBreakpoint, SwBreakpointOps,
     WatchKind,
 };
+use gdbstub::target::ext::exec_file::{ExecFile, ExecFileOps};
+use gdbstub::target::ext::memory_map::{MemoryMap, MemoryMapOps};
 use gdbstub::target::ext::target_description_xml_override::{
     TargetDescriptionXmlOverride, TargetDescriptionXmlOverrideOps,
 };
@@ -58,7 +61,10 @@ use gdbstub::target::{Target, TargetError, TargetResult};
 use gdbstub_arch::x86::reg::id::X86CoreRegId;
 use gdbstub_arch::x86::reg::X86CoreRegs;
 use gdbstub_arch::x86::X86_SSE;
+use oxideav_vfw::emulator::mmu::Perm;
 use oxideav_vfw::emulator::regs::Reg32;
+use oxideav_vfw::pe::sections::Section;
+use oxideav_vfw::pe::Image;
 use oxideav_vfw::{Sandbox, WatchMode, DLL_PROCESS_ATTACH};
 use std::collections::VecDeque;
 use std::io::Write;
@@ -184,7 +190,8 @@ pub fn run_gdb_server(
         }
         None => Arc::new(Mutex::new(None)),
     };
-    let mut target = SandboxTarget::with_forward(sandbox, forward, cli_breakpoints);
+    let mut target =
+        SandboxTarget::with_forward(sandbox, forward, cli_breakpoints, image, name.clone());
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = Box::new(stream);
     let stub = GdbStub::new(connection);
 
@@ -311,6 +318,22 @@ const TARGET_XML: &[u8] = br#"<?xml version="1.0"?>
   </feature>
 </target>
 "#;
+
+/// Map a PE section's permission bits onto one of the three
+/// values the GDB memory-map DTD admits (`ram` / `rom` /
+/// `flash`). Writable sections become `ram` (matches the
+/// "operator can poke this" intuition); read-only or
+/// read-execute sections become `rom`. `flash` is reserved for
+/// the embedded-flash semantics GDB attaches to it (separate
+/// erase-block protocol) and is never the right answer for a
+/// PE image.
+fn section_memory_kind(sec: &Section) -> &'static str {
+    if sec.perm.contains(Perm::W) {
+        "ram"
+    } else {
+        "rom"
+    }
+}
 
 /// Single-step / continue intent set by the GDB resume packet.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -516,6 +539,23 @@ pub struct SandboxTarget {
     /// the MMU's own `kind=mem_*` / `kind=trap` / `kind=exec`
     /// stream. The same handle is held by the `WatchSink`.
     forward: ForwardSink,
+    /// Round-7 P1 — memory-map XML rendered from the loaded PE
+    /// image's section table at construction time. Lazily
+    /// computed via [`SandboxTarget::build_memory_map_xml`] and
+    /// stored as a single owned `String` so the
+    /// `qXfer:memory-map:read` reader can paginate over a stable
+    /// byte-slice without re-walking the section list per
+    /// chunk. Empty when no PE image was loaded (e.g. operator
+    /// passed a non-PE blob).
+    memory_map_xml: String,
+    /// Round-7 P2 — DLL/AX file basename a connected GDB client
+    /// receives via `qXfer:exec-file:read`. Stored as a single
+    /// `String` (rather than the path) so we don't expose the
+    /// operator's local filesystem layout to the wire — `info
+    /// file` shows the codec's natural name (`IR32_32.DLL`,
+    /// `INDEO5.AX`, …) which is what an operator wants. Empty
+    /// when no name was available.
+    exec_file_name: String,
 }
 
 impl SandboxTarget {
@@ -529,7 +569,13 @@ impl SandboxTarget {
     /// shorter spelling for clarity.)
     #[cfg(test)]
     pub fn new(sandbox: Sandbox) -> Self {
-        Self::with_forward(sandbox, Arc::new(Mutex::new(None)), &[])
+        Self::with_forward(
+            sandbox,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            String::new(),
+        )
     }
 
     /// Build a `SandboxTarget` whose underlying [`WatchSink`]
@@ -541,11 +587,17 @@ impl SandboxTarget {
     /// via `--break` — and pre-registers them as `sw_bps` so a
     /// GDB client that attaches halts at each one, while the
     /// event loop emits `kind=breakpoint` JSONL events for the
-    /// detached-client case.
+    /// detached-client case. Round-7 P1+P2 also accept the loaded
+    /// `Image` (used to render a `qXfer:memory-map:read` XML
+    /// document) and the codec's filename (returned to the GDB
+    /// client via `qXfer:exec-file:read` so `info file` shows
+    /// `IR32_32.DLL` rather than the placeholder `<process N>`).
     pub fn with_forward(
         mut sandbox: Sandbox,
         forward: ForwardSink,
         cli_breakpoints: &[u32],
+        image: Option<Image>,
+        exec_file_name: String,
     ) -> Self {
         let watch_queue: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
         let sink = WatchSink::new(watch_queue.clone(), forward.clone());
@@ -558,6 +610,14 @@ impl SandboxTarget {
         // entry because we re-check against `cli_breakpoints` in
         // the event loop below.
         let cli_bps: Vec<u32> = cli_breakpoints.to_vec();
+        // Render the memory-map XML eagerly. Empty when no PE
+        // image is available (the GDB protocol tolerates an empty
+        // `qXfer:memory-map:read` reply — a client just sees no
+        // entries in `info mem`).
+        let memory_map_xml = match image.as_ref() {
+            Some(img) => Self::build_memory_map_xml(img),
+            None => String::new(),
+        };
         Self {
             sandbox,
             sw_bps: cli_bps.clone(),
@@ -566,7 +626,69 @@ impl SandboxTarget {
             watch_queue,
             cli_breakpoints: cli_bps,
             forward,
+            memory_map_xml,
+            exec_file_name,
         }
+    }
+
+    /// Render a GDB `memory-map` XML document describing the
+    /// loaded PE image's section ranges. Each section becomes a
+    /// `<memory>` element whose `start` is the section's
+    /// `va_start`, whose `length` is its `mapped_size` (already
+    /// page-aligned), and whose `type` is `rom` for read-only or
+    /// read-execute sections (`.text`, `.rdata`, …) and `ram`
+    /// for writable ones (`.data`, `.bss`). The GDB DTD only
+    /// admits `ram` / `rom` / `flash` (see
+    /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Memory-Map-Format.html>),
+    /// so an executable + writable section (rare for a real codec
+    /// but possible) is reported as `ram` to honour the
+    /// "writable" precedence.
+    ///
+    /// Section names are emitted as XML comments preceding each
+    /// `<memory>` element so an operator running
+    /// `gdb> show memory-map` sees `.text` / `.data` annotations
+    /// alongside the address ranges.
+    fn build_memory_map_xml(image: &Image) -> String {
+        let mut s = String::with_capacity(256 + image.sections.len() * 96);
+        s.push_str(
+            "<?xml version=\"1.0\"?>\n\
+             <!DOCTYPE memory-map\n\
+                       PUBLIC \"+//IDN gnu.org//DTD GDB Memory Map V1.0//EN\"\n\
+                              \"http://sourceware.org/gdb/gdb-memory-map.dtd\">\n\
+             <memory-map>\n",
+        );
+        for sec in &image.sections {
+            let kind = section_memory_kind(sec);
+            // Sanitize the section name for use inside an XML
+            // comment — strip embedded `--` (which would close
+            // the comment) and any non-printable bytes. PE
+            // section names are typically `.text` / `.data` / …
+            // so this is defensive padding for the malformed
+            // case.
+            let mut safe = String::with_capacity(sec.name.len());
+            let mut last_dash = false;
+            for c in sec.name.chars() {
+                if c.is_ascii_graphic() || c == ' ' {
+                    if c == '-' && last_dash {
+                        // skip — never emit `--` in a comment
+                        continue;
+                    }
+                    last_dash = c == '-';
+                    safe.push(c);
+                } else {
+                    last_dash = false;
+                }
+            }
+            s.push_str("  <!-- ");
+            s.push_str(&safe);
+            s.push_str(" -->\n");
+            s.push_str(&format!(
+                "  <memory type=\"{}\" start=\"0x{:08x}\" length=\"0x{:x}\"/>\n",
+                kind, sec.va_start, sec.mapped_size
+            ));
+        }
+        s.push_str("</memory-map>\n");
+        s
     }
 
     /// Emit a synthetic `kind=breakpoint` JSONL line on the
@@ -621,6 +743,43 @@ impl Target for SandboxTarget {
         &mut self,
     ) -> Option<TargetDescriptionXmlOverrideOps<'_, Self>> {
         Some(self)
+    }
+
+    /// Round-7 P1 — advertise `qXfer:memory-map:read` so a
+    /// connected GDB client's `info mem` / `maintenance info
+    /// sections` shows the loaded codec's PE section table
+    /// (`.text` r-x, `.data` rw-, `.rdata` r--, `.bss` rw-, …)
+    /// instead of "no memory regions". The XML document is
+    /// rendered eagerly at `with_forward` time from the loaded
+    /// `Image::sections` and stored on `Self::memory_map_xml`,
+    /// so the per-chunk reader is a flat byte-slice paginator.
+    /// See
+    /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Memory-Map-Format.html>
+    /// for the schema we follow.
+    fn support_memory_map(&mut self) -> Option<MemoryMapOps<'_, Self>> {
+        if self.memory_map_xml.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    /// Round-7 P2 — advertise `qXfer:exec-file:read` so a GDB
+    /// client's `info file` shows the codec's basename
+    /// (`IR32_32.DLL`, `INDEO5.AX`, …) instead of the placeholder
+    /// `<process N>` gdbstub falls back to. We never had a real
+    /// executable path to surface here in earlier rounds, but
+    /// the operator-facing `--gdb` UX improves significantly
+    /// when stack frames + `info file` show the codec's actual
+    /// name. Returns `None` when no DLL name was available so
+    /// gdbstub can report "unsupported" cleanly rather than
+    /// returning an empty string the client might mis-display.
+    fn support_exec_file(&mut self) -> Option<ExecFileOps<'_, Self>> {
+        if self.exec_file_name.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
     }
 }
 
@@ -896,6 +1055,66 @@ impl TargetDescriptionXmlOverride for SandboxTarget {
         let remaining = TARGET_XML.len() - start;
         let n = remaining.min(length).min(buf.len());
         buf[..n].copy_from_slice(&TARGET_XML[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl MemoryMap for SandboxTarget {
+    /// Round-7 P1 — serve the pre-rendered memory-map XML
+    /// document over the `qXfer:memory-map:read` paginated
+    /// transfer. The document was assembled from the loaded
+    /// PE image's `Image::sections` at construction time (see
+    /// [`SandboxTarget::build_memory_map_xml`]) so per-chunk
+    /// reads are a flat byte-slice walk. Pagination contract
+    /// matches the GDB protocol: an `offset` past the end
+    /// returns `0` (empty / EOF), shorter trailing chunks are
+    /// the natural end-of-document signal.
+    fn memory_map_xml(
+        &self,
+        offset: u64,
+        length: usize,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        let total = self.memory_map_xml.len() as u64;
+        if offset >= total {
+            return Ok(0);
+        }
+        let bytes = self.memory_map_xml.as_bytes();
+        let start = offset as usize;
+        let remaining = bytes.len() - start;
+        let n = remaining.min(length).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl ExecFile for SandboxTarget {
+    /// Round-7 P2 — return the codec's filename (the basename
+    /// the operator passed via the CLI `dll_or_ax_file`
+    /// argument). The GDB client uses this for `info file` and
+    /// frame display. We ignore `_pid` because the sandbox is
+    /// strictly single-process; any `pid` GDB might supply
+    /// resolves to the same DLL.
+    ///
+    /// Pagination matches the GDB qXfer contract — `offset`
+    /// past the end returns `0` (gdbstub frames this as the
+    /// `l<empty>` end-of-stream reply).
+    fn get_exec_file(
+        &self,
+        _pid: Option<Pid>,
+        offset: u64,
+        length: usize,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        let bytes = self.exec_file_name.as_bytes();
+        let total = bytes.len() as u64;
+        if offset >= total {
+            return Ok(0);
+        }
+        let start = offset as usize;
+        let remaining = bytes.len() - start;
+        let n = remaining.min(length).min(buf.len());
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
         Ok(n)
     }
 }
@@ -1416,7 +1635,7 @@ mod tests {
 
         let forward: ForwardSink =
             Arc::new(Mutex::new(Some(Box::new(SharedWriter(captured.clone())))));
-        let mut t = SandboxTarget::with_forward(sb, forward, &[]);
+        let mut t = SandboxTarget::with_forward(sb, forward, &[], None, String::new());
 
         let r = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
         assert_eq!(r, oxideav_vfw::emulator::isa_int::StepOk::Continued);
@@ -1608,7 +1827,13 @@ mod tests {
             Arc::new(Mutex::new(Some(Box::new(SharedWriter(captured.clone())))));
 
         let sb = Sandbox::new();
-        let t = SandboxTarget::with_forward(sb, forward, &[0x10001234, 0x20002020]);
+        let t = SandboxTarget::with_forward(
+            sb,
+            forward,
+            &[0x10001234, 0x20002020],
+            None,
+            String::new(),
+        );
         // Both PCs were pre-registered as `sw_bps` so a connected
         // GDB client would halt at them.
         assert!(t.sw_bps.contains(&0x10001234));
@@ -1645,7 +1870,13 @@ mod tests {
     #[test]
     fn cli_breakpoint_emit_with_no_forward_is_noop() {
         let sb = Sandbox::new();
-        let t = SandboxTarget::with_forward(sb, Arc::new(Mutex::new(None)), &[0x10001234]);
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[0x10001234],
+            None,
+            String::new(),
+        );
         // Should not panic and should leave the forward None.
         t.emit_breakpoint_event(0x10001234);
         assert!(t.forward.lock().unwrap().is_none());
@@ -1698,7 +1929,7 @@ mod tests {
         sb.cpu.regs.gp[Reg32::Edi as usize] = DATA_BASE + 0x100;
         // Register `--break` for the post-`mov` EIP.
         const BP_PC: u32 = CODE_BASE + 2;
-        let mut t = SandboxTarget::with_forward(sb, forward, &[BP_PC]);
+        let mut t = SandboxTarget::with_forward(sb, forward, &[BP_PC], None, String::new());
         // One step — EIP advances to BP_PC. Driver in the real
         // event loop would notice and emit; emulate that here.
         let _ = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
@@ -1807,5 +2038,218 @@ mod tests {
         // Subsequent read at offset == len returns 0.
         let n2 = ok(t.target_description_xml(b"target.xml", n as u64, len, &mut buf));
         assert_eq!(n2, 0);
+    }
+
+    /// Helper — load the synthetic minimal-PE32 DLL into a fresh
+    /// sandbox and return both the `Sandbox` and the `Image` so
+    /// we can drive the round-7 P1 (memory-map) tests against
+    /// real PE section data without dragging in a full codec.
+    fn synth_sandbox_with_image() -> (Sandbox, Image) {
+        let bytes = oxideav_vfw::pe::test_image::build_minimal_dll();
+        let mut sb = Sandbox::new();
+        let img = sb.load("synth.dll", &bytes).expect("load synth dll");
+        (sb, img)
+    }
+
+    /// Round-7 P1 — `build_memory_map_xml` walks the loaded PE
+    /// image's sections and produces a well-formed GDB memory-map
+    /// document that lists each section's `va_start` + length and
+    /// classifies it as `ram` (writable) or `rom` (read-only).
+    /// We assert the canonical wrapper plus at least one
+    /// `<memory>` element for the synthetic DLL's `.text`
+    /// section, which is mapped at `image_base + 0x1000` in
+    /// `build_minimal_dll`.
+    #[test]
+    fn build_memory_map_xml_contains_section_entries() {
+        let (_, img) = synth_sandbox_with_image();
+        let xml = SandboxTarget::build_memory_map_xml(&img);
+
+        // Canonical document boundaries.
+        assert!(
+            xml.starts_with("<?xml version=\"1.0\"?>"),
+            "missing XML prologue: {xml:?}"
+        );
+        assert!(
+            xml.contains("<!DOCTYPE memory-map"),
+            "missing memory-map DOCTYPE: {xml:?}"
+        );
+        assert!(
+            xml.contains("<memory-map>"),
+            "missing root element: {xml:?}"
+        );
+        assert!(
+            xml.trim_end().ends_with("</memory-map>"),
+            "missing closing tag: {xml:?}"
+        );
+
+        // The synthetic DLL has a `.text` section. The exact
+        // byte-window depends on the test image but the section
+        // start address is well-known to be `image_base + 0x1000`.
+        let expected_text_start = format!("0x{:08x}", img.image_base.wrapping_add(0x1000));
+        assert!(
+            xml.contains(&expected_text_start),
+            "missing .text VA `{expected_text_start}` in: {xml:?}"
+        );
+
+        // `.text` is execute-only or read+execute — never
+        // writable — so its kind should be `rom`. We don't need
+        // to over-fit the test; a literal `type="rom"` somewhere
+        // is sufficient evidence the perm classifier ran.
+        assert!(
+            xml.contains(r#"type="rom""#),
+            "expected at least one rom section in: {xml:?}"
+        );
+    }
+
+    /// Round-7 P1 — `support_memory_map` returns `Some` when an
+    /// `Image` was provided and `None` otherwise. Honours the
+    /// "advertise extension only when we have data" contract so
+    /// gdbstub doesn't tell a connected GDB client we support
+    /// the extension and then return an empty document on every
+    /// chunk (which clients sometimes mishandle).
+    #[test]
+    fn support_memory_map_gated_on_image_presence() {
+        // No image — extension should be unavailable.
+        let mut t_none = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_memory_map(&mut t_none).is_none());
+
+        // With an image — extension is wired.
+        let (sb, img) = synth_sandbox_with_image();
+        let mut t_some = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            Some(img),
+            "synth.dll".to_string(),
+        );
+        assert!(Target::support_memory_map(&mut t_some).is_some());
+    }
+
+    /// Round-7 P1 — `qXfer:memory-map:read` paginates the
+    /// rendered XML correctly: assembling chunks of arbitrary
+    /// length yields the full document, offset-past-end returns 0.
+    #[test]
+    fn memory_map_xml_paginates_correctly() {
+        let (sb, img) = synth_sandbox_with_image();
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            Some(img),
+            "synth.dll".to_string(),
+        );
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 32];
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok(MemoryMap::memory_map_xml(&t, offset, buf.len(), &mut buf));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&buf[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(assembled.as_slice(), t.memory_map_xml.as_bytes());
+
+        // Past-EOF read returns 0.
+        let mut buf2 = [0u8; 32];
+        let n = ok(MemoryMap::memory_map_xml(
+            &t,
+            t.memory_map_xml.len() as u64 + 100,
+            buf2.len(),
+            &mut buf2,
+        ));
+        assert_eq!(n, 0);
+    }
+
+    /// Round-7 P2 — `support_exec_file` returns `Some` only
+    /// when a non-empty filename was provided. Empty name is
+    /// the "no DLL loaded" case (e.g. operator passed a non-PE
+    /// blob) and we shouldn't advertise the extension to a
+    /// client that would then mis-display the empty payload.
+    #[test]
+    fn support_exec_file_gated_on_name_presence() {
+        let mut t_none = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_exec_file(&mut t_none).is_none());
+
+        let mut t_some = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "IR32_32.DLL".to_string(),
+        );
+        assert!(Target::support_exec_file(&mut t_some).is_some());
+    }
+
+    /// Round-7 P2 — `get_exec_file` returns the codec basename
+    /// across paginated reads regardless of `pid` (the sandbox
+    /// is single-process, so `Some(_)` and `None` resolve the
+    /// same name).
+    #[test]
+    fn get_exec_file_returns_basename_paginated() {
+        let t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "INDEO5.AX".to_string(),
+        );
+        // Single-shot read covers the whole name.
+        let mut buf = [0u8; 64];
+        let n = ok(ExecFile::get_exec_file(&t, None, 0, buf.len(), &mut buf));
+        assert_eq!(n, "INDEO5.AX".len());
+        assert_eq!(&buf[..n], b"INDEO5.AX");
+
+        // Paginated read — 4 bytes per chunk — assembles the
+        // same string.
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut tiny = [0u8; 4];
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok(ExecFile::get_exec_file(
+                &t,
+                None,
+                offset,
+                tiny.len(),
+                &mut tiny,
+            ));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&tiny[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(assembled, b"INDEO5.AX");
+
+        // `pid` is ignored — single-process sandbox.
+        let pid: Pid = std::num::NonZeroUsize::new(42).expect("non-zero pid");
+        let mut buf2 = [0u8; 64];
+        let n = ok(ExecFile::get_exec_file(
+            &t,
+            Some(pid),
+            0,
+            buf2.len(),
+            &mut buf2,
+        ));
+        assert_eq!(&buf2[..n], b"INDEO5.AX");
+    }
+
+    /// Round-7 P1 — `section_memory_kind` classifier maps the
+    /// PE section permission bits onto the GDB memory-map DTD's
+    /// `ram` / `rom` axis.
+    #[test]
+    fn section_memory_kind_classifies_perms() {
+        // R-only → rom, R+X → rom, R+W → ram, R+W+X → ram.
+        let mk = |perm: Perm| Section {
+            name: "test".to_string(),
+            va_start: 0,
+            mapped_size: 0x1000,
+            perm,
+        };
+        assert_eq!(section_memory_kind(&mk(Perm::R)), "rom");
+        assert_eq!(section_memory_kind(&mk(Perm::R | Perm::X)), "rom");
+        assert_eq!(section_memory_kind(&mk(Perm::R | Perm::W)), "ram");
+        assert_eq!(section_memory_kind(&mk(Perm::R | Perm::W | Perm::X)), "ram");
     }
 }
