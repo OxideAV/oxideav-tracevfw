@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 12 — synthesise a minimal valid PE32 image for cascade module stubs (P1).**
+  `SandboxTarget::synth_module_stub` now emits a self-consistent
+  PE32 image (DOS header with `MZ` magic + `e_lfanew=0x40`, PE
+  signature `PE\0\0`, 20-byte COFF header with
+  `Machine = IMAGE_FILE_MACHINE_I386` + `IMAGE_FILE_DLL`, 224-byte
+  PE32 Optional Header carrying the registered `ImageBase` from
+  `qXfer:libraries:read`, one `.text` section header, and the
+  pre-round-12 ASCII marker as the section's raw payload at file
+  offset `0x200`) instead of the bare ASCII marker. A connected
+  GDB client's `add-symbol-file remote:kernel32.dll` now passes
+  PE magic + section-table validation rather than failing at the
+  first parse step (`(no debugging symbols found)` is the right
+  outcome — the symbols come from the sandbox's host stubs, not
+  from a guest image, but the module is at least structurally
+  valid). The ASCII marker is preserved verbatim inside the
+  `.text` section so operator-grep'ing the file via
+  `vFile:pread` still surfaces `OXIDEAV-VFW STUB MODULE`. Layout
+  follows the public Microsoft PE / COFF specification
+  (<https://learn.microsoft.com/en-us/windows/win32/debug/pe-format>).
+  The `synth_module_stub_format_is_stable` unit test asserts every
+  documented field's wire position; the cascade-module integration
+  test (`host_io_open_cascade_module_resolves_to_synthetic_stub`)
+  validates DOS + PE magic on the bytes returned by `vFile:pread`
+  alongside the marker substring inside the .text payload.
 - **Round 11 — `vFile:fstat` host_io extension (P2).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::host_io::HostIoFstat`, advertised via
