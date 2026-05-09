@@ -8,6 +8,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 15 — IMAGE_IMPORT_DIRECTORY (DataDirectory[1]) + env-var
+  test serialisation.** The synthesised cascade-module PE bytes now
+  carry a fourth section, `.idata`, declaring the cross-module
+  imports for each stub (e.g. `user32` IMPORTS `LoadLibraryA` /
+  `GetProcAddress` from `kernel32`; `msvcrt` IMPORTS `HeapAlloc`,
+  `GetProcessHeap`). Layout follows Microsoft PECOFF §6.4: one
+  20-byte `IMAGE_IMPORT_DESCRIPTOR` per imported DLL
+  (`OriginalFirstThunk`, `TimeDateStamp = 0`,
+  `ForwarderChain = 0`, `Name` RVA, `FirstThunk`), terminated by
+  an all-zero descriptor; parallel INT/IAT thunk arrays (4-byte
+  each, terminated by 0) point at `IMAGE_IMPORT_BY_NAME` records
+  (2-byte hint = 0 + null-terminated function name, 2-byte
+  aligned). `DataDirectory[1]` is wired to the new
+  `(IDATA_RVA, descriptors_size)`; modules with no imports
+  (`kernel32` itself — the canonical leaf) leave the directory at
+  `(0, 0)`. Verified against Apple `llvm-objdump -p`: "DLL Name:
+  kernel32.dll" + "Hint/Ord  Name / 0  LoadLibraryA / 0
+  GetProcAddress" appear under "The Import Tables:". Six new unit
+  tests cover the per-module import surface, DataDirectory[1]
+  wiring (zero + non-zero cases), .idata raw byte layout
+  (descriptors + INT/IAT parallelism + name strings), msvcrt's
+  cross-module imports, reproducibility across pinned timestamps,
+  and an opportunistic `objdump -p` cross-check that no-ops when
+  the host objdump can't grok PE/COFF.
+
+  The `pe_timestamp_env_var_*` and `fstat_mtime_env_var_*` tests
+  now serialise their env-var mutations through a module-scope
+  `ENV_VAR_LOCK: Mutex<()>`, eliminating the release-plz CI
+  flake observed in rounds 13 + 14 where one test's `remove_var`
+  raced another test's `resolve_*()` read. The lock recovers from
+  a poisoned guard so a panic in one test doesn't cascade.
+  Verified by 5x `cargo test pe_timestamp -- --test-threads=4`
+  passing deterministically.
+
 - **Round 14 — per-export 8-byte stubs + IMAGE_DEBUG_DIRECTORY / CodeView RSDS.**
   The synthesised cascade-module PE bytes now lay out one
   unique 8-byte stub per export at `TEXT_RVA + i*8` instead of
