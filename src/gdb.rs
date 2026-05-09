@@ -795,6 +795,7 @@ impl SandboxTarget {
                 bytes: primary_bytes,
             });
         }
+        let timestamp = Self::resolve_pe_timestamp();
         for (name, base) in sandbox.host.modules.iter() {
             // Skip the primary DLL — the loader registered it
             // in `HostState::modules` after `Sandbox::load`, but
@@ -804,7 +805,7 @@ impl SandboxTarget {
             if !primary_name.is_empty() && name.eq_ignore_ascii_case(primary_name) {
                 continue;
             }
-            let bytes = Self::synth_module_stub(name, *base);
+            let bytes = Self::synth_module_stub(name, *base, timestamp);
             files.push(RegisteredFile {
                 name: name.clone(),
                 bytes,
@@ -813,23 +814,144 @@ impl SandboxTarget {
         files
     }
 
-    /// Round-12 P1 — synthesise a minimal valid PE32 image for a
-    /// cascade-loaded module (kernel32.dll, msvcrt.dll, …). The
-    /// Win32 surface for these modules is served by the sandbox's
-    /// host stubs; no real PE bytes exist. Pre-round-12 we
-    /// returned only an ASCII marker — the marker is
-    /// human-readable but real GDB rejects it on the
-    /// `add-symbol-file remote:<name>` path because the bytes
-    /// don't begin with `MZ` and the would-be COFF header is
-    /// garbage.
+    /// Round-13 P2 — per-module export-name list for the
+    /// synthesised PE32 stub's Export Directory. The names
+    /// mirror what the sandbox's `oxideav-vfw` host_stubs
+    /// registry actually intercepts, so a connected GDB client
+    /// running `info functions` after
+    /// `add-symbol-file remote:kernel32.dll` sees recognisable
+    /// Win32 entry points (LoadLibraryA, GetProcAddress, …)
+    /// rather than an empty symbol table.
     ///
-    /// We now lay out a self-consistent PE32 with one `.text`
-    /// section that carries the same `OXIDEAV-VFW STUB MODULE`
-    /// marker text. GDB parses the headers, validates the
-    /// section table, and accepts the module as `(no debugging
-    /// symbols found)` — the right behaviour: the symbols come
-    /// from the host stubs, not from a guest image, but the
-    /// module is at least a structurally valid PE.
+    /// We DON'T depend on `oxideav-vfw` to enumerate the live
+    /// stubs — the workspace policy bars that dep direction
+    /// (consumer→producer would lock us into producer-publish
+    /// lockstep). Instead we hardcode the small per-module
+    /// surface every cascade module is known to expose. The
+    /// list is intentionally narrow: ~20 names per module,
+    /// covering the LoadLibrary / GetProcAddress / heap /
+    /// process / file-IO / registry surface the typical Win32
+    /// codec relocates against.
+    ///
+    /// Unknown module names get a single `DllMain` export so
+    /// the export directory is never zero-length (a 0-entry
+    /// directory is legal but `info functions` then says
+    /// "(no symbols)" — defeating the whole purpose).
+    fn module_exports(name: &str) -> &'static [&'static str] {
+        // Match basename case-insensitively. We compare against
+        // lowercase canonical forms.
+        let lower = name.to_ascii_lowercase();
+        // Trim the `.dll` suffix if present so `kernel32` and
+        // `kernel32.dll` resolve the same.
+        let stem = lower.strip_suffix(".dll").unwrap_or(&lower);
+        match stem {
+            "kernel32" => &[
+                "LoadLibraryA",
+                "LoadLibraryW",
+                "FreeLibrary",
+                "GetProcAddress",
+                "GetModuleHandleA",
+                "GetModuleHandleW",
+                "GetModuleFileNameA",
+                "ExitProcess",
+                "GetCurrentProcess",
+                "GetCurrentThreadId",
+                "GetLastError",
+                "SetLastError",
+                "GetProcessHeap",
+                "HeapAlloc",
+                "HeapFree",
+                "GetSystemTimeAsFileTime",
+                "GetTickCount",
+                "Sleep",
+                "VirtualAlloc",
+                "VirtualFree",
+            ],
+            "user32" => &[
+                "MessageBoxA",
+                "MessageBoxW",
+                "LoadStringA",
+                "GetSystemMetrics",
+                "wsprintfA",
+                "CharNextA",
+                "CharLowerA",
+                "CharUpperA",
+            ],
+            "msvcrt" => &[
+                "malloc", "free", "calloc", "realloc", "memcpy", "memset", "memcmp", "strlen",
+                "strcpy", "strcmp", "strcat", "sprintf", "printf", "fopen", "fclose", "fread",
+                "fwrite", "exit", "atoi", "atof",
+            ],
+            "advapi32" => &[
+                "RegOpenKeyExA",
+                "RegCloseKey",
+                "RegQueryValueExA",
+                "RegSetValueExA",
+                "RegCreateKeyExA",
+            ],
+            "gdi32" => &[
+                "CreateCompatibleDC",
+                "DeleteDC",
+                "SelectObject",
+                "BitBlt",
+                "CreateBitmap",
+            ],
+            "ole32" => &[
+                "CoInitialize",
+                "CoUninitialize",
+                "CoCreateInstance",
+                "CoTaskMemAlloc",
+                "CoTaskMemFree",
+            ],
+            "vfw32" | "msvfw32" => &[
+                "ICOpen",
+                "ICClose",
+                "ICCompress",
+                "ICDecompress",
+                "ICSendMessage",
+                "ICInfo",
+                "ICLocate",
+                "ICGetInfo",
+            ],
+            "winmm" => &[
+                "timeGetTime",
+                "timeBeginPeriod",
+                "timeEndPeriod",
+                "PlaySoundA",
+                "waveOutOpen",
+                "waveOutWrite",
+                "waveOutClose",
+            ],
+            _ => &["DllMain"],
+        }
+    }
+
+    /// Round-12 P1 + Round-13 P2 — synthesise a minimal valid
+    /// PE32 image for a cascade-loaded module (kernel32.dll,
+    /// msvcrt.dll, …). The Win32 surface for these modules is
+    /// served by the sandbox's host stubs; no real PE bytes
+    /// exist. Pre-round-12 we returned only an ASCII marker —
+    /// the marker is human-readable but real GDB rejects it on
+    /// the `add-symbol-file remote:<name>` path because the
+    /// bytes don't begin with `MZ` and the would-be COFF header
+    /// is garbage.
+    ///
+    /// As of round-12 we lay out a self-consistent PE32 with
+    /// one `.text` section that carries the same
+    /// `OXIDEAV-VFW STUB MODULE` marker text. GDB parses the
+    /// headers and validates the section table.
+    ///
+    /// As of round-13 we ALSO emit a `.edata` section
+    /// containing a minimal IMAGE_EXPORT_DIRECTORY that
+    /// advertises the host-stubbed Win32 entry points the
+    /// sandbox actually intercepts (e.g. `LoadLibraryA`,
+    /// `GetProcAddress`, …). Each export's address points at a
+    /// single `0xC3` (`ret`) byte at the start of `.text`, so
+    /// `info functions` after `add-symbol-file remote:kernel32.dll`
+    /// shows recognisable Win32 names instead of "(no symbols)".
+    /// The function list per module comes from `module_exports`
+    /// — a hardcoded per-DLL surface (we don't depend on
+    /// `oxideav-vfw` per workspace policy).
     ///
     /// Layout (file offsets, all little-endian):
     /// - `0x000..0x040` — IMAGE_DOS_HEADER (64 bytes); `MZ`
@@ -841,50 +963,57 @@ impl SandboxTarget {
     /// - `0x040..0x044` — `PE\0\0` signature (4 bytes).
     /// - `0x044..0x058` — IMAGE_FILE_HEADER / COFF header (20
     ///   bytes): Machine = `IMAGE_FILE_MACHINE_I386` (0x014c),
-    ///   NumberOfSections = 1, TimeDateStamp = 0,
+    ///   NumberOfSections = 2, TimeDateStamp = `timestamp`
+    ///   (env-pinnable via `OXIDEAV_TRACEVFW_PE_TIMESTAMP`),
     ///   PointerToSymbolTable = 0, NumberOfSymbols = 0,
     ///   SizeOfOptionalHeader = 224 (PE32),
     ///   Characteristics = `IMAGE_FILE_DLL` |
     ///   `IMAGE_FILE_EXECUTABLE_IMAGE` | `IMAGE_FILE_32BIT_MACHINE`.
     /// - `0x058..0x138` — IMAGE_OPTIONAL_HEADER32 (224 bytes):
     ///   Magic = 0x010b (PE32), AddressOfEntryPoint = 0x1000
-    ///   (start of the .text RVA — a no-op landing pad),
+    ///   (start of the .text RVA — the `0xC3` ret pad),
     ///   ImageBase = the registered image_base we hand the GDB
     ///   client via `qXfer:libraries:read`,
     ///   SectionAlignment = 0x1000, FileAlignment = 0x200,
     ///   MajorOperatingSystemVersion = 4 (NT 4 baseline),
-    ///   MajorSubsystemVersion = 4, SizeOfImage = 0x2000
-    ///   (one page of headers + one page of section), SizeOfHeaders =
-    ///   0x200, Subsystem = 3 (`IMAGE_SUBSYSTEM_WINDOWS_CUI`),
+    ///   MajorSubsystemVersion = 4, SizeOfImage = headers page +
+    ///   .text page + .edata page, SizeOfHeaders = 0x200,
+    ///   Subsystem = 3 (`IMAGE_SUBSYSTEM_WINDOWS_CUI`),
     ///   DllCharacteristics = 0, SizeOfStackReserve = 0x100000,
     ///   SizeOfStackCommit = 0x1000, SizeOfHeapReserve =
     ///   0x100000, SizeOfHeapCommit = 0x1000, NumberOfRvaAndSizes
-    ///   = 16 (all DataDirectory entries zeroed).
-    /// - `0x138..0x160` — one IMAGE_SECTION_HEADER (40 bytes):
-    ///   Name = `.text\0\0\0`, VirtualSize = marker length,
-    ///   VirtualAddress = 0x1000, SizeOfRawData = 0x200
-    ///   (FileAlignment), PointerToRawData = 0x200,
-    ///   Characteristics = `IMAGE_SCN_MEM_EXECUTE` |
-    ///   `IMAGE_SCN_MEM_READ` | `IMAGE_SCN_CNT_CODE`.
-    /// - `0x160..0x200` — zero padding to FileAlignment.
-    /// - `0x200..0x200 + len(marker)` — `.text` raw data: the
-    ///   ASCII marker (`OXIDEAV-VFW STUB MODULE\n…`).
+    ///   = 16. `DataDirectory[0]` (Export Table) =
+    ///   `(EDATA_RVA, edata_virtual_size)`; rest zeroed.
+    /// - `0x138..0x160` — IMAGE_SECTION_HEADER for `.text`
+    ///   (40 bytes): VirtualAddress = 0x1000, contains the
+    ///   `0xC3` ret byte followed by the marker text.
+    ///   Characteristics = CODE | EXECUTE | READ.
+    /// - `0x160..0x188` — IMAGE_SECTION_HEADER for `.edata`
+    ///   (40 bytes): VirtualAddress = 0x2000, contains the
+    ///   IMAGE_EXPORT_DIRECTORY + parallel arrays + name strings.
+    ///   Characteristics = INITIALIZED_DATA | READ.
+    /// - `0x188..0x200` — zero padding to FileAlignment.
+    /// - `0x200..` — `.text` raw data: `0xC3` then marker.
+    /// - `0x400..` — `.edata` raw data: 40-byte
+    ///   IMAGE_EXPORT_DIRECTORY at offset 0, followed by
+    ///   AddressOfFunctions / AddressOfNames /
+    ///   AddressOfNameOrdinals arrays then null-terminated
+    ///   DLL name + per-export name strings.
     /// - tail — zero padding so the total length is a multiple
     ///   of FileAlignment (0x200).
-    ///
-    /// The exact byte layout is a stability contract for tests
-    /// but not for the GDB protocol — what matters on the wire
-    /// is "passes PE32 magic + section-table validation".
     ///
     /// References (public-domain):
     /// - Microsoft PE / COFF specification:
     ///   <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format>
-    fn synth_module_stub(name: &str, image_base: u32) -> Vec<u8> {
+    ///   §3.3 (COFF File Header), §3.4 (Optional Header Data
+    ///   Directories), §6.3 (.edata Section / Export Directory).
+    fn synth_module_stub(name: &str, image_base: u32, timestamp: u32) -> Vec<u8> {
         const FILE_ALIGNMENT: usize = 0x200;
         const SECTION_ALIGNMENT: u32 = 0x1000;
-        const HEADERS_SIZE: usize = FILE_ALIGNMENT; // 0x200 — DOS + PE + COFF + Optional + 1 SectionHdr fits comfortably
+        const HEADERS_SIZE: usize = FILE_ALIGNMENT; // 0x200 — DOS + PE + COFF + Optional + 2 SectionHdr fits in 0x1B0 < 0x200
         const TEXT_RVA: u32 = 0x1000; // first page after headers
-                                      // PE/COFF constants (Microsoft PE format spec):
+        const EDATA_RVA: u32 = 0x2000; // second page (after .text)
+                                       // PE/COFF constants (Microsoft PE format spec):
         const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
         const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
         const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
@@ -893,28 +1022,121 @@ impl SandboxTarget {
         const IMAGE_NT_OPTIONAL_HDR32_MAGIC: u16 = 0x010b;
         const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
         const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
+        const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
         const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
         const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
         const NUMBER_OF_DATA_DIRECTORIES: u32 = 16;
         const SIZE_OF_OPTIONAL_HEADER: u16 = 224; // PE32 standard
+        const NUMBER_OF_SECTIONS: u16 = 2;
 
-        // The .text section's raw payload: the existing ASCII
-        // marker, intact. Operators / tests can still grep
-        // `OXIDEAV-VFW STUB MODULE` out of the bytes.
+        // The .text section's raw payload: a single `0xC3`
+        // (x86 `ret`) followed by the existing ASCII marker.
+        // Every export points at the same ret byte at TEXT_RVA
+        // — calling any "stub" function returns immediately.
+        // Operators / tests can still grep `OXIDEAV-VFW STUB
+        // MODULE` out of the bytes after the leading 0xC3.
         let marker = format!(
             "OXIDEAV-VFW STUB MODULE\nname={name}\nimage_base=0x{image_base:08x}\n\
              (no PE content; symbols served by sandbox host stubs)\n"
         );
-        let marker_bytes = marker.as_bytes();
-        let virtual_size = marker_bytes.len() as u32;
-        // Raw .text size rounded up to FileAlignment.
-        let raw_size = marker_bytes.len().div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
-        let total_file_size = HEADERS_SIZE + raw_size;
-        // Image size: headers page + section virtual size rounded
-        // up to SectionAlignment. Marker is small so the section
-        // fits in one page.
-        let section_virt_padded = virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
-        let size_of_image = SECTION_ALIGNMENT + section_virt_padded;
+        let mut text_payload = Vec::with_capacity(1 + marker.len());
+        text_payload.push(0xC3); // ret — exported-function landing pad
+        text_payload.extend_from_slice(marker.as_bytes());
+        let text_virtual_size = text_payload.len() as u32;
+        let text_raw_size = text_payload.len().div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
+
+        // --- Build .edata raw payload ------------------------
+        // Layout of .edata (RVAs are absolute within the image):
+        //   +0x00 IMAGE_EXPORT_DIRECTORY (40 bytes)
+        //   +0x28 AddressOfFunctions (4 * N)
+        //   +0x28 + 4N AddressOfNames (4 * N)
+        //   +0x28 + 8N AddressOfNameOrdinals (2 * N)
+        //   then DLL name C-string, then N C-strings (the export names)
+        let exports = Self::module_exports(name);
+        let n_exports = exports.len() as u32;
+        let export_dir_size: u32 = 40;
+        let funcs_size: u32 = 4 * n_exports;
+        let names_size: u32 = 4 * n_exports;
+        let ordinals_size: u32 = 2 * n_exports;
+        let funcs_off: u32 = export_dir_size;
+        let names_off: u32 = funcs_off + funcs_size;
+        let ordinals_off: u32 = names_off + names_size;
+        let strings_off: u32 = ordinals_off + ordinals_size;
+
+        // The DLL name string goes first in the strings block,
+        // followed by each export name. We compute string
+        // offsets up-front so we can fill the parallel arrays.
+        let dll_name_bytes = name.as_bytes();
+        let mut string_offsets: Vec<u32> = Vec::with_capacity(exports.len());
+        let mut cursor: u32 = strings_off + dll_name_bytes.len() as u32 + 1;
+        for &exp in exports {
+            string_offsets.push(cursor);
+            cursor += exp.len() as u32 + 1;
+        }
+        let edata_virtual_size = cursor;
+        let edata_raw_size =
+            (edata_virtual_size as usize).div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
+
+        let mut edata = vec![0u8; edata_raw_size];
+        // IMAGE_EXPORT_DIRECTORY (40 bytes), per PE/COFF §6.3.
+        // ExportFlags (+0)        = 0 (reserved)
+        // TimeDateStamp (+4)      = the same env-pinned stamp.
+        edata[4..8].copy_from_slice(&timestamp.to_le_bytes());
+        // MajorVersion (+8) / MinorVersion (+10) = 0
+        // NameRVA (+12)           = RVA of the DLL name string.
+        edata[12..16].copy_from_slice(&(EDATA_RVA + strings_off).to_le_bytes());
+        // OrdinalBase (+16)       = 1 (conventional).
+        edata[16..20].copy_from_slice(&1u32.to_le_bytes());
+        // AddressTableEntries (+20) = N
+        edata[20..24].copy_from_slice(&n_exports.to_le_bytes());
+        // NumberOfNamePointers (+24) = N
+        edata[24..28].copy_from_slice(&n_exports.to_le_bytes());
+        // ExportAddressTableRVA (+28)
+        edata[28..32].copy_from_slice(&(EDATA_RVA + funcs_off).to_le_bytes());
+        // NamePointerRVA (+32)
+        edata[32..36].copy_from_slice(&(EDATA_RVA + names_off).to_le_bytes());
+        // OrdinalTableRVA (+36)
+        edata[36..40].copy_from_slice(&(EDATA_RVA + ordinals_off).to_le_bytes());
+
+        // AddressOfFunctions: every entry points at TEXT_RVA
+        // (the 0xC3 ret pad).
+        for i in 0..exports.len() {
+            let off = (funcs_off as usize) + 4 * i;
+            edata[off..off + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        }
+        // AddressOfNames: RVA of the i-th name string.
+        for (i, &abs) in string_offsets.iter().enumerate() {
+            let off = (names_off as usize) + 4 * i;
+            edata[off..off + 4].copy_from_slice(&(EDATA_RVA + abs).to_le_bytes());
+        }
+        // AddressOfNameOrdinals: i-th name → i-th function. PE
+        // spec: this is an unbiased index INTO the function
+        // table (NOT ordinal-base-adjusted).
+        for i in 0..exports.len() {
+            let off = (ordinals_off as usize) + 2 * i;
+            edata[off..off + 2].copy_from_slice(&(i as u16).to_le_bytes());
+        }
+        // DLL name string at strings_off.
+        let mut so = strings_off as usize;
+        edata[so..so + dll_name_bytes.len()].copy_from_slice(dll_name_bytes);
+        edata[so + dll_name_bytes.len()] = 0;
+        so += dll_name_bytes.len() + 1;
+        // Per-export name strings.
+        for &exp in exports {
+            let b = exp.as_bytes();
+            edata[so..so + b.len()].copy_from_slice(b);
+            edata[so + b.len()] = 0;
+            so += b.len() + 1;
+        }
+
+        // --- Compute file layout & SizeOfImage ---------------
+        let text_file_off = HEADERS_SIZE;
+        let edata_file_off = text_file_off + text_raw_size;
+        let total_file_size = edata_file_off + edata_raw_size;
+
+        let text_virt_padded = text_virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
+        let edata_virt_padded = edata_virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
+        let size_of_image = SECTION_ALIGNMENT + text_virt_padded + edata_virt_padded;
 
         let mut out = vec![0u8; total_file_size];
 
@@ -929,9 +1151,10 @@ impl SandboxTarget {
         // --- COFF header (0x044..0x058, 20 bytes) ------------
         let coff = 0x44;
         out[coff..coff + 2].copy_from_slice(&IMAGE_FILE_MACHINE_I386.to_le_bytes());
-        out[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
-                                                                      // TimeDateStamp / PointerToSymbolTable / NumberOfSymbols
-                                                                      // already zero from the initial fill.
+        out[coff + 2..coff + 4].copy_from_slice(&NUMBER_OF_SECTIONS.to_le_bytes());
+        // Round-13 P1 — env-pinnable PE TimeDateStamp.
+        out[coff + 4..coff + 8].copy_from_slice(&timestamp.to_le_bytes());
+        // PointerToSymbolTable / NumberOfSymbols already zero.
         out[coff + 16..coff + 18].copy_from_slice(&SIZE_OF_OPTIONAL_HEADER.to_le_bytes());
         let characteristics: u16 = IMAGE_FILE_DLL
             | IMAGE_FILE_EXECUTABLE_IMAGE
@@ -944,11 +1167,12 @@ impl SandboxTarget {
         out[opt..opt + 2].copy_from_slice(&IMAGE_NT_OPTIONAL_HDR32_MAGIC.to_le_bytes());
         out[opt + 2] = 4; // MajorLinkerVersion
         out[opt + 3] = 0; // MinorLinkerVersion
-        out[opt + 4..opt + 8].copy_from_slice(&(raw_size as u32).to_le_bytes()); // SizeOfCode
-                                                                                 // SizeOfInitializedData / SizeOfUninitializedData = 0
+        out[opt + 4..opt + 8].copy_from_slice(&(text_raw_size as u32).to_le_bytes()); // SizeOfCode
+        out[opt + 8..opt + 12].copy_from_slice(&(edata_raw_size as u32).to_le_bytes()); // SizeOfInitializedData
+                                                                                        // SizeOfUninitializedData (+12) = 0
         out[opt + 16..opt + 20].copy_from_slice(&TEXT_RVA.to_le_bytes()); // AddressOfEntryPoint
         out[opt + 20..opt + 24].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
-        out[opt + 24..opt + 28].copy_from_slice(&0u32.to_le_bytes()); // BaseOfData
+        out[opt + 24..opt + 28].copy_from_slice(&EDATA_RVA.to_le_bytes()); // BaseOfData
         out[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes()); // ImageBase
         out[opt + 32..opt + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         out[opt + 36..opt + 40].copy_from_slice(&(FILE_ALIGNMENT as u32).to_le_bytes());
@@ -970,23 +1194,35 @@ impl SandboxTarget {
         out[opt + 84..opt + 88].copy_from_slice(&0x0000_1000u32.to_le_bytes()); // SizeOfHeapCommit = 4 KiB
                                                                                 // LoaderFlags (+88) = 0
         out[opt + 92..opt + 96].copy_from_slice(&NUMBER_OF_DATA_DIRECTORIES.to_le_bytes()); // NumberOfRvaAndSizes
-                                                                                            // DataDirectory[16] (+96..+96+128 = +96..+224) all zero already.
+                                                                                            // DataDirectory[0] = Export Table (RVA + Size).
+        out[opt + 96..opt + 100].copy_from_slice(&EDATA_RVA.to_le_bytes());
+        out[opt + 100..opt + 104].copy_from_slice(&edata_virtual_size.to_le_bytes());
+        // DataDirectory[1..16] all zero already.
 
-        // --- Section header (0x138..0x160, 40 bytes) ---------
-        let sec = 0x138;
-        out[sec..sec + 8].copy_from_slice(b".text\0\0\0");
-        out[sec + 8..sec + 12].copy_from_slice(&virtual_size.to_le_bytes()); // VirtualSize
-        out[sec + 12..sec + 16].copy_from_slice(&TEXT_RVA.to_le_bytes()); // VirtualAddress
-        out[sec + 16..sec + 20].copy_from_slice(&(raw_size as u32).to_le_bytes()); // SizeOfRawData
-        out[sec + 20..sec + 24].copy_from_slice(&(HEADERS_SIZE as u32).to_le_bytes()); // PointerToRawData
-                                                                                       // PointerToRelocations / PointerToLinenumbers = 0
-                                                                                       // NumberOfRelocations / NumberOfLinenumbers = 0
-        let sec_chars: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
-        out[sec + 36..sec + 40].copy_from_slice(&sec_chars.to_le_bytes());
+        // --- Section header for .text (0x138..0x160) ---------
+        let sec_text = 0x138;
+        out[sec_text..sec_text + 8].copy_from_slice(b".text\0\0\0");
+        out[sec_text + 8..sec_text + 12].copy_from_slice(&text_virtual_size.to_le_bytes()); // VirtualSize
+        out[sec_text + 12..sec_text + 16].copy_from_slice(&TEXT_RVA.to_le_bytes()); // VirtualAddress
+        out[sec_text + 16..sec_text + 20].copy_from_slice(&(text_raw_size as u32).to_le_bytes()); // SizeOfRawData
+        out[sec_text + 20..sec_text + 24].copy_from_slice(&(text_file_off as u32).to_le_bytes()); // PointerToRawData
+        let text_chars: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+        out[sec_text + 36..sec_text + 40].copy_from_slice(&text_chars.to_le_bytes());
+
+        // --- Section header for .edata (0x160..0x188) --------
+        let sec_edata = 0x160;
+        out[sec_edata..sec_edata + 8].copy_from_slice(b".edata\0\0");
+        out[sec_edata + 8..sec_edata + 12].copy_from_slice(&edata_virtual_size.to_le_bytes()); // VirtualSize
+        out[sec_edata + 12..sec_edata + 16].copy_from_slice(&EDATA_RVA.to_le_bytes()); // VirtualAddress
+        out[sec_edata + 16..sec_edata + 20].copy_from_slice(&(edata_raw_size as u32).to_le_bytes()); // SizeOfRawData
+        out[sec_edata + 20..sec_edata + 24].copy_from_slice(&(edata_file_off as u32).to_le_bytes()); // PointerToRawData
+        let edata_chars: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        out[sec_edata + 36..sec_edata + 40].copy_from_slice(&edata_chars.to_le_bytes());
 
         // --- .text raw data (0x200..) ------------------------
-        out[HEADERS_SIZE..HEADERS_SIZE + marker_bytes.len()].copy_from_slice(marker_bytes);
-        // Tail bytes already zero from the initial fill.
+        out[text_file_off..text_file_off + text_payload.len()].copy_from_slice(&text_payload);
+        // --- .edata raw data (after .text) -------------------
+        out[edata_file_off..edata_file_off + edata.len()].copy_from_slice(&edata);
 
         out
     }
@@ -999,6 +1235,35 @@ impl SandboxTarget {
     /// is `u32`. A pre-epoch system clock reads as 0.
     fn resolve_fstat_mtime() -> u32 {
         if let Ok(raw) = std::env::var("OXIDEAV_TRACEVFW_FSTAT_MTIME") {
+            if let Ok(parsed) = raw.trim().parse::<u64>() {
+                return u32::try_from(parsed).unwrap_or(u32::MAX);
+            }
+        }
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => u32::try_from(d.as_secs()).unwrap_or(u32::MAX),
+            Err(_) => 0,
+        }
+    }
+
+    /// Round-13 P1 — resolve the PE COFF header
+    /// `TimeDateStamp` (low-order DWORD of seconds-since-1970)
+    /// embedded into every synthesised cascade-module stub.
+    /// Honours the `OXIDEAV_TRACEVFW_PE_TIMESTAMP` env var
+    /// (decimal epoch seconds) when set; falls back to the wall
+    /// clock at construction time. Same saturation semantics as
+    /// `resolve_fstat_mtime`.
+    ///
+    /// Pinning this lets two runs of `oxidetracevfw --gdb …`
+    /// produce byte-identical synthesised PE module bytes — the
+    /// only otherwise wall-clock-dependent field. Mirrors the
+    /// `OXIDEAV_TRACEVFW_FSTAT_MTIME` env-pin pattern from
+    /// round 11 (PE TimeDateStamp ↔ vFile:fstat st_mtime).
+    ///
+    /// References:
+    /// - Microsoft PE/COFF specification §3.3 (COFF File
+    ///   Header), `TimeDateStamp` field.
+    fn resolve_pe_timestamp() -> u32 {
+        if let Ok(raw) = std::env::var("OXIDEAV_TRACEVFW_PE_TIMESTAMP") {
             if let Ok(parsed) = raw.trim().parse::<u64>() {
                 return u32::try_from(parsed).unwrap_or(u32::MAX);
             }
@@ -4117,21 +4382,27 @@ mod tests {
         // pread the full cascade stub. Round-12 P1: the bytes
         // are now a valid PE32 image, so the byte view is no
         // longer pure ASCII (headers + padding contain zeros).
-        // We assert the PE magic bytes are present + the marker
-        // text still appears inside the .text section starting
-        // at file offset 0x200.
+        // Round-13 P2: byte at 0x200 is the `0xC3` ret pad —
+        // every export points at it. The marker text follows
+        // at 0x201.
         let mut buf = vec![0u8; st_k32.st_size as usize];
         let n = ok_io(HostIoPread::pread(&mut t, fd_k32, buf.len(), 0, &mut buf));
         assert_eq!(n, buf.len());
         assert_eq!(&buf[0..2], b"MZ", "DOS magic must be present");
         assert_eq!(&buf[0x40..0x44], b"PE\0\0", "PE signature must be present");
-        // .text payload sits at file offset 0x200; locate the
-        // marker substring there for a stable test.
-        let text_section = std::str::from_utf8(&buf[0x200..])
+        assert_eq!(buf[0x200], 0xC3, "first .text byte is x86 ret");
+        // .text marker starts at 0x201, runs to the .text raw
+        // size end (0x400 here — one FileAlignment block).
+        let text_section = std::str::from_utf8(&buf[0x201..0x400])
             .expect("text section is ASCII through end of marker (then zero pad)");
         assert!(text_section.contains("OXIDEAV-VFW STUB MODULE"));
         assert!(text_section.contains("name=kernel32.dll"));
         assert!(text_section.contains("image_base=0x77000000"));
+        // Round-13 P2: .edata follows .text at file offset
+        // 0x400. kernel32 export names appear verbatim.
+        let edata = String::from_utf8_lossy(&buf[0x400..]);
+        assert!(edata.contains("LoadLibraryA\0"));
+        assert!(edata.contains("GetProcAddress\0"));
 
         // msvcrt.dll resolves too (proves the registry isn't
         // limited to one cascade entry).
@@ -4230,25 +4501,30 @@ mod tests {
         assert!(st.st_size > 0);
     }
 
-    /// Round-12 P1 — `synth_module_stub` emits a structurally
-    /// valid PE32 image. The DOS header, PE signature, COFF
-    /// header (Machine = i386, NumberOfSections = 1,
+    /// Round-12 P1 + Round-13 — `synth_module_stub` emits a
+    /// structurally valid PE32 image with two sections
+    /// (`.text`, `.edata`). The DOS header, PE signature, COFF
+    /// header (Machine = i386, NumberOfSections = 2,
+    /// TimeDateStamp = the env-pinnable timestamp,
     /// Characteristics = DLL | EXE | 32BIT), Optional header
     /// (Magic = 0x010b PE32, ImageBase = the registered base,
-    /// SectionAlignment 0x1000, FileAlignment 0x200), and one
-    /// `.text` section header are all in canonical positions
-    /// per the Microsoft PE/COFF spec. The marker text from
+    /// SectionAlignment 0x1000, FileAlignment 0x200,
+    /// DataDirectory[0] = Export Table RVA + Size), and the
+    /// two section headers are all in canonical positions per
+    /// the Microsoft PE/COFF spec. The marker text from
     /// pre-round-12 is preserved as the .text raw payload at
-    /// file offset 0x200 so operator-grep'ing the stub still
-    /// works. The byte layout is a stability contract for tests
-    /// + tooling but not a wire contract for the GDB protocol.
+    /// file offset 0x201 (after the leading 0xC3 ret pad) so
+    /// operator-grep'ing the stub still works. The byte layout
+    /// is a stability contract for tests + tooling but not a
+    /// wire contract for the GDB protocol.
     #[test]
     fn synth_module_stub_format_is_stable() {
-        let bytes = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000);
+        let bytes = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 0x6800_0000);
         // Total length is FileAlignment-aligned (0x200 headers
-        // + at least one 0x200 section page).
+        // + at least one 0x200 .text page + one 0x200 .edata
+        // page = 0x600 minimum).
         assert!(
-            bytes.len() >= 0x400 && bytes.len() % 0x200 == 0,
+            bytes.len() >= 0x600 && bytes.len() % 0x200 == 0,
             "PE32 file size must be FileAlignment-aligned"
         );
 
@@ -4264,7 +4540,9 @@ mod tests {
         let machine = u16::from_le_bytes(bytes[0x44..0x46].try_into().unwrap());
         assert_eq!(machine, 0x014c, "Machine = IMAGE_FILE_MACHINE_I386");
         let num_sections = u16::from_le_bytes(bytes[0x46..0x48].try_into().unwrap());
-        assert_eq!(num_sections, 1, "NumberOfSections = 1");
+        assert_eq!(num_sections, 2, "NumberOfSections = 2 (.text + .edata)");
+        let timestamp = u32::from_le_bytes(bytes[0x48..0x4c].try_into().unwrap());
+        assert_eq!(timestamp, 0x6800_0000, "TimeDateStamp echoes the argument");
         let opt_size = u16::from_le_bytes(bytes[0x54..0x56].try_into().unwrap());
         assert_eq!(opt_size, 224, "SizeOfOptionalHeader = 224 (PE32)");
         let chars = u16::from_le_bytes(bytes[0x56..0x58].try_into().unwrap());
@@ -4288,8 +4566,17 @@ mod tests {
         assert_eq!(size_of_headers, 0x200);
         let num_dirs = u32::from_le_bytes(bytes[0x58 + 92..0x58 + 96].try_into().unwrap());
         assert_eq!(num_dirs, 16, "NumberOfRvaAndSizes = 16");
+        // DataDirectory[0] = Export Table — RVA must equal
+        // EDATA_RVA (0x2000) and Size must be non-zero.
+        let export_rva = u32::from_le_bytes(bytes[0x58 + 96..0x58 + 100].try_into().unwrap());
+        assert_eq!(export_rva, 0x2000, "DataDirectory[0].RVA = .edata RVA");
+        let export_size = u32::from_le_bytes(bytes[0x58 + 100..0x58 + 104].try_into().unwrap());
+        assert!(
+            export_size >= 40,
+            "DataDirectory[0].Size >= IMAGE_EXPORT_DIRECTORY size (40)"
+        );
 
-        // Section header
+        // .text section header
         assert_eq!(&bytes[0x138..0x140], b".text\0\0\0", "section name");
         let virt_addr = u32::from_le_bytes(bytes[0x138 + 12..0x138 + 16].try_into().unwrap());
         assert_eq!(virt_addr, 0x1000);
@@ -4300,10 +4587,127 @@ mod tests {
         assert!(sec_chars & 0x4000_0000 != 0, "IMAGE_SCN_MEM_READ");
         assert!(sec_chars & 0x0000_0020 != 0, "IMAGE_SCN_CNT_CODE");
 
-        // Marker text inside .text raw data (offset 0x200).
-        let payload = std::str::from_utf8(&bytes[0x200..]).expect(".text payload is ASCII");
-        assert!(payload.starts_with("OXIDEAV-VFW STUB MODULE\n"));
-        assert!(payload.contains("\nname=kernel32.dll\n"));
-        assert!(payload.contains("\nimage_base=0x77000000\n"));
+        // .edata section header
+        assert_eq!(&bytes[0x160..0x168], b".edata\0\0", ".edata section name");
+        let edata_va = u32::from_le_bytes(bytes[0x160 + 12..0x160 + 16].try_into().unwrap());
+        assert_eq!(edata_va, 0x2000);
+        let edata_raw_ptr = u32::from_le_bytes(bytes[0x160 + 20..0x160 + 24].try_into().unwrap());
+        assert_eq!(edata_raw_ptr, 0x400, ".edata raw at headers + .text page");
+        let edata_chars = u32::from_le_bytes(bytes[0x160 + 36..0x160 + 40].try_into().unwrap());
+        assert!(edata_chars & 0x4000_0000 != 0, ".edata IMAGE_SCN_MEM_READ");
+        assert!(
+            edata_chars & 0x0000_0040 != 0,
+            ".edata IMAGE_SCN_CNT_INITIALIZED_DATA"
+        );
+
+        // .text raw data: 0xC3 ret followed by marker text.
+        assert_eq!(bytes[0x200], 0xC3, ".text starts with x86 'ret'");
+        let payload =
+            std::str::from_utf8(&bytes[0x201..0x400]).expect(".text payload tail is ASCII");
+        let trimmed = payload.trim_end_matches('\0');
+        assert!(trimmed.starts_with("OXIDEAV-VFW STUB MODULE\n"));
+        assert!(trimmed.contains("\nname=kernel32.dll\n"));
+        assert!(trimmed.contains("\nimage_base=0x77000000\n"));
+
+        // .edata raw data: IMAGE_EXPORT_DIRECTORY at offset
+        // 0x400 with the env-pinned TimeDateStamp echoed.
+        let edata_ts = u32::from_le_bytes(bytes[0x404..0x408].try_into().unwrap());
+        assert_eq!(edata_ts, 0x6800_0000);
+        let ordinal_base = u32::from_le_bytes(bytes[0x410..0x414].try_into().unwrap());
+        assert_eq!(ordinal_base, 1, "OrdinalBase = 1");
+        let n_funcs = u32::from_le_bytes(bytes[0x414..0x418].try_into().unwrap());
+        assert!(n_funcs >= 1, "AddressTableEntries non-zero");
+        // First AddressOfFunctions entry must point at TEXT_RVA
+        // (the 0xC3 ret pad).
+        let funcs_rva = u32::from_le_bytes(bytes[0x41C..0x420].try_into().unwrap());
+        // funcs_rva is in image coordinates (EDATA_RVA + 0x28).
+        assert_eq!(funcs_rva, 0x2028);
+        let first_func = u32::from_le_bytes(bytes[0x428..0x42C].try_into().unwrap());
+        assert_eq!(first_func, 0x1000, "every export RVA points at TEXT_RVA");
+        // Verify a known kernel32 export name appears verbatim.
+        let edata_payload = &bytes[0x400..];
+        let s = String::from_utf8_lossy(edata_payload);
+        assert!(
+            s.contains("LoadLibraryA\0"),
+            "kernel32 must export LoadLibraryA"
+        );
+        assert!(s.contains("GetProcAddress\0"));
+        assert!(s.contains("kernel32.dll\0"), "DLL name string present");
+    }
+
+    /// Round-13 P2 — different module names produce different
+    /// export tables. user32 exports `MessageBoxA`, kernel32
+    /// does not. Asserts the per-module name list is wired
+    /// through `synth_module_stub`.
+    #[test]
+    fn synth_module_stub_per_module_export_lists() {
+        let k32 = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 0);
+        let u32 = SandboxTarget::synth_module_stub("user32.dll", 0x7800_0000, 0);
+        let k32_s = String::from_utf8_lossy(&k32);
+        let u32_s = String::from_utf8_lossy(&u32);
+        assert!(k32_s.contains("LoadLibraryA\0"));
+        assert!(!k32_s.contains("MessageBoxA\0"));
+        assert!(u32_s.contains("MessageBoxA\0"));
+        assert!(!u32_s.contains("LoadLibraryA\0"));
+    }
+
+    /// Round-13 P2 — unknown module names get a non-empty
+    /// export list (single `DllMain`) so `info functions` is
+    /// never empty for cascade modules with no curated list.
+    #[test]
+    fn synth_module_stub_unknown_module_has_dllmain() {
+        let bytes = SandboxTarget::synth_module_stub("foobar.dll", 0x7900_0000, 0);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("DllMain\0"));
+    }
+
+    /// Round-13 P1 — pinning `OXIDEAV_TRACEVFW_PE_TIMESTAMP`
+    /// makes two synth_module_stub calls byte-identical
+    /// (reproducibility for `objdump -p`).
+    #[test]
+    fn pe_timestamp_env_var_overrides_wall_clock() {
+        std::env::set_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP", "1700000000");
+        let got = SandboxTarget::resolve_pe_timestamp();
+        std::env::remove_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP");
+        assert_eq!(got, 1_700_000_000);
+    }
+
+    /// Round-13 P1 — invalid env-var values fall back to the
+    /// wall clock instead of panicking.
+    #[test]
+    fn pe_timestamp_env_var_invalid_falls_back_to_wall_clock() {
+        std::env::set_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP", "garbage");
+        let got = SandboxTarget::resolve_pe_timestamp();
+        std::env::remove_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP");
+        assert_ne!(got, 0);
+    }
+
+    /// Round-13 P1 — values past `u32::MAX` saturate (year-2106
+    /// horizon) rather than wrapping or panicking.
+    #[test]
+    fn pe_timestamp_env_var_saturates_at_u32_max() {
+        std::env::set_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP", "99999999999");
+        let got = SandboxTarget::resolve_pe_timestamp();
+        std::env::remove_var("OXIDEAV_TRACEVFW_PE_TIMESTAMP");
+        assert_eq!(got, u32::MAX);
+    }
+
+    /// Round-13 P1 — with the env var pinned, two
+    /// `synth_module_stub` calls produce byte-identical PE
+    /// bytes. This is the reproducibility property the env-pin
+    /// exists to guarantee (`objdump -p` yields stable output).
+    #[test]
+    fn synth_module_stub_is_reproducible_with_pinned_timestamp() {
+        let a = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 1_700_000_000);
+        let b = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 1_700_000_000);
+        assert_eq!(
+            a, b,
+            "synth_module_stub must be deterministic for a fixed timestamp"
+        );
+        // Different timestamps produce different bytes (the
+        // stamp is embedded in 2 distinct locations: COFF
+        // header + IMAGE_EXPORT_DIRECTORY).
+        let c = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 1_700_000_001);
+        assert_ne!(a, c);
     }
 }
