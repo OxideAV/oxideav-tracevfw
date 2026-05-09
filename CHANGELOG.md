@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 14 — per-export 8-byte stubs + IMAGE_DEBUG_DIRECTORY / CodeView RSDS.**
+  The synthesised cascade-module PE bytes now lay out one
+  unique 8-byte stub per export at `TEXT_RVA + i*8` instead of
+  every export pointing at a single shared `0xC3 ret` byte.
+  Each stub is `B0 NN B4 NN CC C3 90 90` — `mov al, stub_id_lo`
+  + `mov ah, stub_id_hi` + `int3` + `ret` + 2 nop pads
+  (Intel SDM Vol. 2). The `int3` traps in the sandbox CPU; the
+  GDB event-loop trap handler reads `(AH << 8) | AL` from the
+  live registers, looks up the per-export `StubEntry` in the
+  new host-side `stub_table`, and emits a
+  `{"kind":"stub_call","module":"…","export":"…","stub_id":N,"pc":"0x…"}`
+  JSONL line into the `--trace-output` forward sink (deduped on
+  first call per stub VA so a hot loop doesn't spam). The same
+  emission also fires from a "first-call memwatch" hook on the
+  post-step EIP path so a guest jump landing directly on a stub
+  start (without going through int3) still surfaces. New
+  `monitor stubs` command dumps the entire table; `monitor
+  stats` adds a `host_stubs=<N>` counter.
+  
+  A `.debug` section (DataDirectory[6]) now carries an
+  IMAGE_DEBUG_DIRECTORY (28 bytes, Type =
+  IMAGE_DEBUG_TYPE_CODEVIEW) pointing at a CodeView RSDS record:
+  4-byte `RSDS` magic + 16-byte stable per-module GUID
+  (deterministic FNV-1a 64×2 over `name + image_base`) + 4-byte
+  age (=1) + null-terminated UTF-8 PDB filename
+  (`<basename>.pdb`). With the debug directory wired, a
+  connected GDB client's `info sharedlibrary` shows a non-`(none)`
+  Symbols column hint per cascade module instead of the empty
+  placeholder. Layout follows Microsoft PECOFF §6.6 (Debug
+  Directory + CodeView records). Ten new unit tests cover the
+  stub-byte layout, stub_id sequencing across modules,
+  `stable_module_guid` determinism + distinctness,
+  `strip_dll_suffix`, host-side stub lookup by VA + by int3 PC,
+  emit-once dedupe, JSONL wire shape, and `build_files`
+  multi-module population. Existing `synth_module_stub_format_is_stable`
+  + `host_io_open_cascade_module_resolves_to_synthetic_stub`
+  tests adjusted for the 3-section layout (`.text` + `.edata` +
+  `.debug`) + 8-byte stub bytes; integration test
+  `qrcmd_monitor_commands_return_sandbox_state` extended to
+  validate `monitor stubs` + `monitor help` advertising +
+  `host_stubs=` line in `monitor stats`.
 - **Round 12 — synthesise a minimal valid PE32 image for cascade module stubs (P1).**
   `SandboxTarget::synth_module_stub` now emits a self-consistent
   PE32 image (DOS header with `MZ` magic + `e_lfanew=0x40`, PE

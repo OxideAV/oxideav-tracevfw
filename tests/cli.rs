@@ -1978,6 +1978,8 @@ fn qrcmd_monitor_commands_return_sandbox_state() {
         out.contains("modules"),
         "monitor help missing modules: {out:?}"
     );
+    // Round-14 — `monitor stubs` advertised in `monitor help`.
+    assert!(out.contains("stubs"), "monitor help missing stubs: {out:?}");
 
     // 2. monitor stats — instr_count + counters lines.
     sock.write_all(&rcmd("stats")).expect("write monitor stats");
@@ -2003,6 +2005,11 @@ fn qrcmd_monitor_commands_return_sandbox_state() {
     assert!(
         out.contains("host_io_files="),
         "monitor stats missing host_io_files: {out:?}"
+    );
+    // Round-14 — host_stubs counter (per-export stub registry).
+    assert!(
+        out.contains("host_stubs="),
+        "monitor stats missing host_stubs: {out:?}"
     );
 
     // 3. monitor breakpoints — lists the CLI-registered PC.
@@ -2056,7 +2063,21 @@ fn qrcmd_monitor_commands_return_sandbox_state() {
         "monitor files expected at least the primary entry, got: {out:?}"
     );
 
-    // 7. unknown command — informative reply, still OK.
+    // 7. monitor stubs (round-14) — lists the per-export host
+    //    stub registry. The synth DLL doesn't trigger a cascade
+    //    load on its own, so we accept either the populated
+    //    table OR the empty placeholder; the wire-level test
+    //    below is the dedicated stub_table population check
+    //    in src/gdb.rs unit tests.
+    sock.write_all(&rcmd("stubs")).expect("write monitor stubs");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    assert!(
+        out.contains("stub_id=") || out.contains("no host stubs registered"),
+        "monitor stubs expected stub_id= or empty placeholder, got: {out:?}"
+    );
+
+    // 8. unknown command — informative reply, still OK.
     sock.write_all(&rcmd("frobnicate"))
         .expect("write monitor frobnicate");
     let (out, term) = drain_monitor_output(&mut sock);

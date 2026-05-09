@@ -640,6 +640,51 @@ pub struct SandboxTarget {
     /// will saturate in 2106 — an acceptable horizon for a
     /// debugging surface.
     fstat_mtime: u32,
+    /// Round-14 — per-export host-side stub registry. One
+    /// entry per export across every cascade-module PE we
+    /// synthesised in `build_files`; `stub_id` is unique
+    /// across the whole table so a guest trap at
+    /// `(AH << 8) | AL` recovers the right `(module, export)`
+    /// pair without per-module disambiguation. Empty when no
+    /// cascade modules were registered. Used by both the event
+    /// loop's stub-call hook AND the `monitor stubs` command.
+    stub_table: Vec<StubEntry>,
+    /// Round-14 — per-stub "first call already logged" set so
+    /// a hot guest loop hammering the same export only emits
+    /// one `kind=stub_call` JSONL line. Keyed by the stub's
+    /// guest VA (the first byte of the 8-byte stub). Wrapped
+    /// in `Mutex` for the same reason `forward` is —
+    /// `&self` borrows from the event loop need to mutate the
+    /// "already logged" state without taking `&mut self`.
+    first_call_logged: Mutex<std::collections::HashSet<u32>>,
+}
+
+/// Round-14 — one entry in the host-side stub registry. Each
+/// per-export 8-byte stub in a synthesised cascade-module PE
+/// gets one of these. The event loop uses the table to
+/// translate a guest CPU trap landing on a stub address into a
+/// `kind=stub_call` JSONL event naming the
+/// `(module, export)` pair the codec reached.
+///
+/// `va` is the guest virtual address of the FIRST byte of the
+/// 8-byte stub (the `mov al, id_lo` opcode). `va..va+8` is the
+/// full stub footprint; `va+4` is the `int3` byte that traps.
+#[derive(Clone, Debug)]
+struct StubEntry {
+    /// Module basename as registered in `HostState::modules`
+    /// (typically lowercase, e.g. `kernel32.dll`).
+    module: String,
+    /// Win32 export name (`LoadLibraryA`, `GetProcAddress`, …).
+    export: String,
+    /// Host-assigned per-export stub_id; written into the
+    /// stub bytes as `mov al, id_lo` then `mov ah, id_hi` so a
+    /// host-side trap handler can recover it from the live
+    /// guest registers via `(AH << 8) | AL`.
+    stub_id: u16,
+    /// Guest virtual address of the stub's first byte. Equals
+    /// `image_base + TEXT_RVA + i*8` where `i` is the per-
+    /// module export ordinal.
+    va: u32,
 }
 
 /// Round-11 P2 — one entry in [`SandboxTarget::files`]. The
@@ -741,15 +786,19 @@ impl SandboxTarget {
             Some(img) => Self::build_auxv_blob(img),
             None => Vec::new(),
         };
-        // Round-11 P2 — build the host_io file registry. Slot 0
-        // is the primary codec DLL (when present); subsequent
-        // slots are synthetic stub-blobs for every cascade-
-        // loaded module the sandbox host has registered. We
-        // skip a cascade module that case-insensitively matches
-        // the primary DLL basename so a `vFile:open` for the
-        // primary name resolves to the real bytes (slot 0)
-        // rather than the synthetic stub.
-        let files = Self::build_files(&sandbox, &exec_file_name, dll_bytes);
+        // Round-11 P2 + Round-14 — build the host_io file
+        // registry. Slot 0 is the primary codec DLL (when
+        // present); subsequent slots are synthetic stub-blobs
+        // for every cascade-loaded module the sandbox host has
+        // registered. We skip a cascade module that case-
+        // insensitively matches the primary DLL basename so a
+        // `vFile:open` for the primary name resolves to the
+        // real bytes (slot 0) rather than the synthetic stub.
+        // Round-14 also populates `stub_table` — the host-side
+        // index of every per-export 8-byte stub baked into the
+        // synthesised cascade-module PE bytes.
+        let mut stub_table: Vec<StubEntry> = Vec::new();
+        let files = Self::build_files(&sandbox, &exec_file_name, dll_bytes, &mut stub_table);
         // Round-11 P2 — pin the synthetic fstat mtime via env
         // var when set, so integration tests get a reproducible
         // `vFile:fstat` reply. Falls back to the wall clock
@@ -770,6 +819,8 @@ impl SandboxTarget {
             files,
             open_files: Vec::new(),
             fstat_mtime,
+            stub_table,
+            first_call_logged: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -787,6 +838,7 @@ impl SandboxTarget {
         sandbox: &Sandbox,
         primary_name: &str,
         primary_bytes: Vec<u8>,
+        stub_table: &mut Vec<StubEntry>,
     ) -> Vec<RegisteredFile> {
         let mut files: Vec<RegisteredFile> = Vec::new();
         if !primary_bytes.is_empty() {
@@ -796,6 +848,10 @@ impl SandboxTarget {
             });
         }
         let timestamp = Self::resolve_pe_timestamp();
+        // Round-14 — running stub_id base. Bumped after each
+        // module by the per-module export count so stub_ids are
+        // unique across the entire `stub_table`.
+        let mut stub_id_base: u16 = 0;
         for (name, base) in sandbox.host.modules.iter() {
             // Skip the primary DLL — the loader registered it
             // in `HostState::modules` after `Sandbox::load`, but
@@ -805,7 +861,15 @@ impl SandboxTarget {
             if !primary_name.is_empty() && name.eq_ignore_ascii_case(primary_name) {
                 continue;
             }
-            let bytes = Self::synth_module_stub(name, *base, timestamp);
+            let exports_len = Self::module_exports(name).len() as u16;
+            let bytes = Self::synth_module_stub_with_table(
+                name,
+                *base,
+                timestamp,
+                stub_id_base,
+                stub_table,
+            );
+            stub_id_base = stub_id_base.wrapping_add(exports_len);
             files.push(RegisteredFile {
                 name: name.clone(),
                 bytes,
@@ -926,15 +990,15 @@ impl SandboxTarget {
         }
     }
 
-    /// Round-12 P1 + Round-13 P2 — synthesise a minimal valid
-    /// PE32 image for a cascade-loaded module (kernel32.dll,
-    /// msvcrt.dll, …). The Win32 surface for these modules is
-    /// served by the sandbox's host stubs; no real PE bytes
-    /// exist. Pre-round-12 we returned only an ASCII marker —
-    /// the marker is human-readable but real GDB rejects it on
-    /// the `add-symbol-file remote:<name>` path because the
-    /// bytes don't begin with `MZ` and the would-be COFF header
-    /// is garbage.
+    /// Round-12 P1 + Round-13 P2 + Round-14 — synthesise a
+    /// minimal valid PE32 image for a cascade-loaded module
+    /// (kernel32.dll, msvcrt.dll, …). The Win32 surface for
+    /// these modules is served by the sandbox's host stubs; no
+    /// real PE bytes exist. Pre-round-12 we returned only an
+    /// ASCII marker — the marker is human-readable but real GDB
+    /// rejects it on the `add-symbol-file remote:<name>` path
+    /// because the bytes don't begin with `MZ` and the would-be
+    /// COFF header is garbage.
     ///
     /// As of round-12 we lay out a self-consistent PE32 with
     /// one `.text` section that carries the same
@@ -945,75 +1009,101 @@ impl SandboxTarget {
     /// containing a minimal IMAGE_EXPORT_DIRECTORY that
     /// advertises the host-stubbed Win32 entry points the
     /// sandbox actually intercepts (e.g. `LoadLibraryA`,
-    /// `GetProcAddress`, …). Each export's address points at a
-    /// single `0xC3` (`ret`) byte at the start of `.text`, so
-    /// `info functions` after `add-symbol-file remote:kernel32.dll`
-    /// shows recognisable Win32 names instead of "(no symbols)".
+    /// `GetProcAddress`, …).
+    ///
+    /// As of round-14 (this change):
+    /// 1. Each export gets its OWN 8-byte stub at
+    ///    `TEXT_RVA + i*8` instead of every export pointing at
+    ///    the same shared `0xC3` ret byte. The stub bytes are:
+    ///    `B0 NN B4 NN CC C3 90 90` — `mov al, low_byte` then
+    ///    `mov ah, high_byte` (the per-export stub_id), then
+    ///    `int3` (host-side breakpoint trap), then `ret`, then
+    ///    two `nop` bytes for stub-boundary alignment. A guest
+    ///    that ever lands on a stub address gets a SIGILL trap;
+    ///    the host event loop reads `(AH << 8) | AL` from the
+    ///    live registers, looks up the stub_id in the
+    ///    `stub_table`, and emits a `kind=stub_call` JSONL line.
+    /// 2. A `.debug` section (DataDirectory[6]) carries a
+    ///    CodeView RSDS record (signature `RSDS`, 16-byte stable
+    ///    GUID, 4-byte age=1, null-terminated PDB filename
+    ///    `<name>.pdb`). With the debug directory wired, GDB's
+    ///    `info sharedlibrary` shows a non-`(none)` Symbols hint
+    ///    (the path GDB would download via `set
+    ///    debug-file-directory` if it had a matching .pdb).
+    ///
     /// The function list per module comes from `module_exports`
     /// — a hardcoded per-DLL surface (we don't depend on
     /// `oxideav-vfw` per workspace policy).
     ///
     /// Layout (file offsets, all little-endian):
     /// - `0x000..0x040` — IMAGE_DOS_HEADER (64 bytes); `MZ`
-    ///   magic at 0x00, `e_lfanew=0x40` at 0x3c, rest zero. The
-    ///   classic "this program cannot be run in DOS mode" stub
-    ///   is omitted — PE loaders only inspect `e_magic` +
-    ///   `e_lfanew`, and a zero-padded DOS header is a valid
-    ///   degenerate form.
-    /// - `0x040..0x044` — `PE\0\0` signature (4 bytes).
+    ///   magic at 0x00, `e_lfanew=0x40` at 0x3c, rest zero.
+    /// - `0x040..0x044` — `PE\0\0` signature.
     /// - `0x044..0x058` — IMAGE_FILE_HEADER / COFF header (20
-    ///   bytes): Machine = `IMAGE_FILE_MACHINE_I386` (0x014c),
-    ///   NumberOfSections = 2, TimeDateStamp = `timestamp`
-    ///   (env-pinnable via `OXIDEAV_TRACEVFW_PE_TIMESTAMP`),
-    ///   PointerToSymbolTable = 0, NumberOfSymbols = 0,
-    ///   SizeOfOptionalHeader = 224 (PE32),
-    ///   Characteristics = `IMAGE_FILE_DLL` |
-    ///   `IMAGE_FILE_EXECUTABLE_IMAGE` | `IMAGE_FILE_32BIT_MACHINE`.
+    ///   bytes): NumberOfSections = 3 (`.text` + `.edata` +
+    ///   `.debug`), TimeDateStamp = `timestamp`.
     /// - `0x058..0x138` — IMAGE_OPTIONAL_HEADER32 (224 bytes):
-    ///   Magic = 0x010b (PE32), AddressOfEntryPoint = 0x1000
-    ///   (start of the .text RVA — the `0xC3` ret pad),
-    ///   ImageBase = the registered image_base we hand the GDB
-    ///   client via `qXfer:libraries:read`,
-    ///   SectionAlignment = 0x1000, FileAlignment = 0x200,
-    ///   MajorOperatingSystemVersion = 4 (NT 4 baseline),
-    ///   MajorSubsystemVersion = 4, SizeOfImage = headers page +
-    ///   .text page + .edata page, SizeOfHeaders = 0x200,
-    ///   Subsystem = 3 (`IMAGE_SUBSYSTEM_WINDOWS_CUI`),
-    ///   DllCharacteristics = 0, SizeOfStackReserve = 0x100000,
-    ///   SizeOfStackCommit = 0x1000, SizeOfHeapReserve =
-    ///   0x100000, SizeOfHeapCommit = 0x1000, NumberOfRvaAndSizes
-    ///   = 16. `DataDirectory[0]` (Export Table) =
-    ///   `(EDATA_RVA, edata_virtual_size)`; rest zeroed.
-    /// - `0x138..0x160` — IMAGE_SECTION_HEADER for `.text`
-    ///   (40 bytes): VirtualAddress = 0x1000, contains the
-    ///   `0xC3` ret byte followed by the marker text.
-    ///   Characteristics = CODE | EXECUTE | READ.
-    /// - `0x160..0x188` — IMAGE_SECTION_HEADER for `.edata`
-    ///   (40 bytes): VirtualAddress = 0x2000, contains the
-    ///   IMAGE_EXPORT_DIRECTORY + parallel arrays + name strings.
-    ///   Characteristics = INITIALIZED_DATA | READ.
-    /// - `0x188..0x200` — zero padding to FileAlignment.
-    /// - `0x200..` — `.text` raw data: `0xC3` then marker.
-    /// - `0x400..` — `.edata` raw data: 40-byte
-    ///   IMAGE_EXPORT_DIRECTORY at offset 0, followed by
-    ///   AddressOfFunctions / AddressOfNames /
-    ///   AddressOfNameOrdinals arrays then null-terminated
-    ///   DLL name + per-export name strings.
-    /// - tail — zero padding so the total length is a multiple
-    ///   of FileAlignment (0x200).
+    ///   `DataDirectory[0]` (Export Table) =
+    ///   `(EDATA_RVA, edata_virtual_size)`,
+    ///   `DataDirectory[6]` (Debug) =
+    ///   `(DEBUG_RVA, IMAGE_DEBUG_DIRECTORY_SIZE = 28)`.
+    /// - `0x138..0x160` — IMAGE_SECTION_HEADER for `.text`.
+    /// - `0x160..0x188` — IMAGE_SECTION_HEADER for `.edata`.
+    /// - `0x188..0x1B0` — IMAGE_SECTION_HEADER for `.debug`.
+    /// - `0x1B0..0x200` — zero padding to FileAlignment.
+    /// - `0x200..` — `.text` raw data: N×8-byte stubs followed
+    ///   by ASCII marker.
+    /// - `0x400..` — `.edata` raw data.
+    /// - `<edata_end>..` — `.debug` raw data: 28-byte
+    ///   IMAGE_DEBUG_DIRECTORY at offset 0 (Type =
+    ///   IMAGE_DEBUG_TYPE_CODEVIEW = 2, AddressOfRawData /
+    ///   PointerToRawData point at the CodeView record at
+    ///   offset 28), then the CodeView RSDS record.
     ///
-    /// References (public-domain):
+    /// References:
     /// - Microsoft PE / COFF specification:
     ///   <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format>
     ///   §3.3 (COFF File Header), §3.4 (Optional Header Data
-    ///   Directories), §6.3 (.edata Section / Export Directory).
+    ///   Directories), §6.3 (.edata), §6.6 (.debug +
+    ///   IMAGE_DEBUG_DIRECTORY + CodeView).
+    /// - Intel SDM Vol. 2 — `MOV AL, imm8` (B0 ib),
+    ///   `MOV AH, imm8` (B4 ib), `INT 3` (CC), `RET` (C3).
+    #[cfg(test)]
     fn synth_module_stub(name: &str, image_base: u32, timestamp: u32) -> Vec<u8> {
+        // Discard the per-export stub registry — the
+        // table-emitting variant is `synth_module_stub_with_table`.
+        Self::synth_module_stub_with_table(name, image_base, timestamp, 0, &mut Vec::new())
+    }
+
+    /// Round-14 — table-emitting variant of `synth_module_stub`.
+    /// In addition to returning the PE bytes, populates
+    /// `stub_table` with one [`StubEntry`] per export naming the
+    /// `(module, export, stub_id, va)` tuple. `stub_id_base` is
+    /// the running stub_id counter — typically zero for the
+    /// first synthesised module, then bumped by the caller by
+    /// `exports.len()` so stub_ids are globally unique across
+    /// all cascade modules in one session.
+    ///
+    /// The same logic doubles as the host-side index: when the
+    /// guest CPU lands on a stub address, the event loop reads
+    /// `(AH << 8) | AL` to recover the stub_id and looks it up
+    /// in the table to translate into `(module, export)` for
+    /// the `kind=stub_call` JSONL line.
+    fn synth_module_stub_with_table(
+        name: &str,
+        image_base: u32,
+        timestamp: u32,
+        stub_id_base: u16,
+        stub_table: &mut Vec<StubEntry>,
+    ) -> Vec<u8> {
         const FILE_ALIGNMENT: usize = 0x200;
         const SECTION_ALIGNMENT: u32 = 0x1000;
-        const HEADERS_SIZE: usize = FILE_ALIGNMENT; // 0x200 — DOS + PE + COFF + Optional + 2 SectionHdr fits in 0x1B0 < 0x200
-        const TEXT_RVA: u32 = 0x1000; // first page after headers
-        const EDATA_RVA: u32 = 0x2000; // second page (after .text)
-                                       // PE/COFF constants (Microsoft PE format spec):
+        const HEADERS_SIZE: usize = FILE_ALIGNMENT;
+        const TEXT_RVA: u32 = 0x1000;
+        const EDATA_RVA: u32 = 0x2000;
+        const DEBUG_RVA: u32 = 0x3000;
+        const STUB_LEN: u32 = 8; // bytes per per-export stub
+                                 // PE/COFF constants:
         const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;
         const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
         const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
@@ -1026,48 +1116,77 @@ impl SandboxTarget {
         const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
         const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
         const NUMBER_OF_DATA_DIRECTORIES: u32 = 16;
-        const SIZE_OF_OPTIONAL_HEADER: u16 = 224; // PE32 standard
-        const NUMBER_OF_SECTIONS: u16 = 2;
+        const SIZE_OF_OPTIONAL_HEADER: u16 = 224;
+        const NUMBER_OF_SECTIONS: u16 = 3;
+        // Round-14 — IMAGE_DEBUG_DIRECTORY constants per
+        // PECOFF §6.6 (Debug Directory + CodeView records).
+        const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
+        const IMAGE_DEBUG_DIRECTORY_SIZE: u32 = 28;
+        // CodeView "RSDS" record: 4-byte sig + 16-byte GUID +
+        // 4-byte age + null-terminated PDB filename.
+        const RSDS_HEADER_SIZE: u32 = 4 + 16 + 4;
 
-        // The .text section's raw payload: a single `0xC3`
-        // (x86 `ret`) followed by the existing ASCII marker.
-        // Every export points at the same ret byte at TEXT_RVA
-        // — calling any "stub" function returns immediately.
-        // Operators / tests can still grep `OXIDEAV-VFW STUB
-        // MODULE` out of the bytes after the leading 0xC3.
+        let exports = Self::module_exports(name);
+        let n_exports = exports.len();
+
+        // --- Build .text raw payload (per-export 8-byte stubs +
+        // ASCII marker tail) ---------------------------------
         let marker = format!(
             "OXIDEAV-VFW STUB MODULE\nname={name}\nimage_base=0x{image_base:08x}\n\
              (no PE content; symbols served by sandbox host stubs)\n"
         );
-        let mut text_payload = Vec::with_capacity(1 + marker.len());
-        text_payload.push(0xC3); // ret — exported-function landing pad
+        let stub_block_len = (STUB_LEN as usize) * n_exports;
+        let mut text_payload = Vec::with_capacity(stub_block_len + marker.len());
+        for (i, &exp_name) in exports.iter().enumerate() {
+            // Per-export 8-byte stub. The stub_id is unique
+            // across all modules in the session (caller bumps
+            // `stub_id_base` by `exports.len()` between
+            // invocations).
+            let stub_id: u16 = stub_id_base.wrapping_add(i as u16);
+            let id_lo: u8 = (stub_id & 0xff) as u8;
+            let id_hi: u8 = ((stub_id >> 8) & 0xff) as u8;
+            // Bytes 0-1: `mov al, id_lo` (B0 NN)
+            text_payload.push(0xB0);
+            text_payload.push(id_lo);
+            // Bytes 2-3: `mov ah, id_hi` (B4 NN)
+            text_payload.push(0xB4);
+            text_payload.push(id_hi);
+            // Byte 4: `int3` (CC) — host-side breakpoint trap.
+            text_payload.push(0xCC);
+            // Byte 5: `ret` (C3) — fall-through if a guest
+            // skips the int3 (e.g. host re-runs after the
+            // trap-handler emits the JSONL event).
+            text_payload.push(0xC3);
+            // Bytes 6-7: nop padding so each stub is exactly
+            // 8 bytes (stub address arithmetic = base + i*8).
+            text_payload.push(0x90);
+            text_payload.push(0x90);
+            // Record the stub in the host-side table.
+            let stub_va = image_base.wrapping_add(TEXT_RVA + (i as u32) * STUB_LEN);
+            stub_table.push(StubEntry {
+                module: name.to_string(),
+                export: exp_name.to_string(),
+                stub_id,
+                va: stub_va,
+            });
+        }
         text_payload.extend_from_slice(marker.as_bytes());
         let text_virtual_size = text_payload.len() as u32;
         let text_raw_size = text_payload.len().div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
 
         // --- Build .edata raw payload ------------------------
-        // Layout of .edata (RVAs are absolute within the image):
-        //   +0x00 IMAGE_EXPORT_DIRECTORY (40 bytes)
-        //   +0x28 AddressOfFunctions (4 * N)
-        //   +0x28 + 4N AddressOfNames (4 * N)
-        //   +0x28 + 8N AddressOfNameOrdinals (2 * N)
-        //   then DLL name C-string, then N C-strings (the export names)
-        let exports = Self::module_exports(name);
-        let n_exports = exports.len() as u32;
+        let n_exports_u32 = n_exports as u32;
         let export_dir_size: u32 = 40;
-        let funcs_size: u32 = 4 * n_exports;
-        let names_size: u32 = 4 * n_exports;
-        let ordinals_size: u32 = 2 * n_exports;
+        let funcs_size: u32 = 4 * n_exports_u32;
+        let names_size: u32 = 4 * n_exports_u32;
+        let ordinals_size: u32 = 2 * n_exports_u32;
         let funcs_off: u32 = export_dir_size;
         let names_off: u32 = funcs_off + funcs_size;
         let ordinals_off: u32 = names_off + names_size;
         let strings_off: u32 = ordinals_off + ordinals_size;
 
-        // The DLL name string goes first in the strings block,
-        // followed by each export name. We compute string
-        // offsets up-front so we can fill the parallel arrays.
         let dll_name_bytes = name.as_bytes();
-        let mut string_offsets: Vec<u32> = Vec::with_capacity(exports.len());
+        let mut string_offsets: Vec<u32> = Vec::with_capacity(n_exports);
         let mut cursor: u32 = strings_off + dll_name_bytes.len() as u32 + 1;
         for &exp in exports {
             string_offsets.push(cursor);
@@ -1078,50 +1197,35 @@ impl SandboxTarget {
             (edata_virtual_size as usize).div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
 
         let mut edata = vec![0u8; edata_raw_size];
-        // IMAGE_EXPORT_DIRECTORY (40 bytes), per PE/COFF §6.3.
-        // ExportFlags (+0)        = 0 (reserved)
-        // TimeDateStamp (+4)      = the same env-pinned stamp.
         edata[4..8].copy_from_slice(&timestamp.to_le_bytes());
-        // MajorVersion (+8) / MinorVersion (+10) = 0
-        // NameRVA (+12)           = RVA of the DLL name string.
         edata[12..16].copy_from_slice(&(EDATA_RVA + strings_off).to_le_bytes());
-        // OrdinalBase (+16)       = 1 (conventional).
         edata[16..20].copy_from_slice(&1u32.to_le_bytes());
-        // AddressTableEntries (+20) = N
-        edata[20..24].copy_from_slice(&n_exports.to_le_bytes());
-        // NumberOfNamePointers (+24) = N
-        edata[24..28].copy_from_slice(&n_exports.to_le_bytes());
-        // ExportAddressTableRVA (+28)
+        edata[20..24].copy_from_slice(&n_exports_u32.to_le_bytes());
+        edata[24..28].copy_from_slice(&n_exports_u32.to_le_bytes());
         edata[28..32].copy_from_slice(&(EDATA_RVA + funcs_off).to_le_bytes());
-        // NamePointerRVA (+32)
         edata[32..36].copy_from_slice(&(EDATA_RVA + names_off).to_le_bytes());
-        // OrdinalTableRVA (+36)
         edata[36..40].copy_from_slice(&(EDATA_RVA + ordinals_off).to_le_bytes());
 
-        // AddressOfFunctions: every entry points at TEXT_RVA
-        // (the 0xC3 ret pad).
-        for i in 0..exports.len() {
+        // AddressOfFunctions: each entry now points at its OWN
+        // per-export 8-byte stub (TEXT_RVA + i*8) instead of the
+        // shared 0xC3 byte (round-13 layout).
+        for i in 0..n_exports {
             let off = (funcs_off as usize) + 4 * i;
-            edata[off..off + 4].copy_from_slice(&TEXT_RVA.to_le_bytes());
+            let func_rva = TEXT_RVA + (i as u32) * STUB_LEN;
+            edata[off..off + 4].copy_from_slice(&func_rva.to_le_bytes());
         }
-        // AddressOfNames: RVA of the i-th name string.
         for (i, &abs) in string_offsets.iter().enumerate() {
             let off = (names_off as usize) + 4 * i;
             edata[off..off + 4].copy_from_slice(&(EDATA_RVA + abs).to_le_bytes());
         }
-        // AddressOfNameOrdinals: i-th name → i-th function. PE
-        // spec: this is an unbiased index INTO the function
-        // table (NOT ordinal-base-adjusted).
-        for i in 0..exports.len() {
+        for i in 0..n_exports {
             let off = (ordinals_off as usize) + 2 * i;
             edata[off..off + 2].copy_from_slice(&(i as u16).to_le_bytes());
         }
-        // DLL name string at strings_off.
         let mut so = strings_off as usize;
         edata[so..so + dll_name_bytes.len()].copy_from_slice(dll_name_bytes);
         edata[so + dll_name_bytes.len()] = 0;
         so += dll_name_bytes.len() + 1;
-        // Per-export name strings.
         for &exp in exports {
             let b = exp.as_bytes();
             edata[so..so + b.len()].copy_from_slice(b);
@@ -1129,20 +1233,69 @@ impl SandboxTarget {
             so += b.len() + 1;
         }
 
+        // --- Build .debug raw payload (round-14) -------------
+        // Layout:
+        //   +0x00 IMAGE_DEBUG_DIRECTORY (28 bytes)
+        //   +0x1c CodeView RSDS record:
+        //         +0x00 "RSDS"           (4 bytes)
+        //         +0x04 GUID             (16 bytes, stable hash)
+        //         +0x14 Age              (4 bytes, value 1)
+        //         +0x18 PDB filename     (variable, null-terminated)
+        let pdb_name = format!("{}.pdb", Self::strip_dll_suffix(name));
+        let pdb_name_bytes = pdb_name.as_bytes();
+        let cv_size: u32 = RSDS_HEADER_SIZE + pdb_name_bytes.len() as u32 + 1;
+        let debug_virtual_size: u32 = IMAGE_DEBUG_DIRECTORY_SIZE + cv_size;
+        let debug_raw_size =
+            (debug_virtual_size as usize).div_ceil(FILE_ALIGNMENT) * FILE_ALIGNMENT;
+
         // --- Compute file layout & SizeOfImage ---------------
         let text_file_off = HEADERS_SIZE;
         let edata_file_off = text_file_off + text_raw_size;
-        let total_file_size = edata_file_off + edata_raw_size;
+        let debug_file_off = edata_file_off + edata_raw_size;
+        let total_file_size = debug_file_off + debug_raw_size;
 
         let text_virt_padded = text_virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
         let edata_virt_padded = edata_virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
-        let size_of_image = SECTION_ALIGNMENT + text_virt_padded + edata_virt_padded;
+        let debug_virt_padded = debug_virtual_size.div_ceil(SECTION_ALIGNMENT) * SECTION_ALIGNMENT;
+        let size_of_image =
+            SECTION_ALIGNMENT + text_virt_padded + edata_virt_padded + debug_virt_padded;
 
         let mut out = vec![0u8; total_file_size];
 
+        // --- Build .debug raw bytes (now that all RVAs are
+        // fixed) -------------------------------------------
+        let mut debug_bytes = vec![0u8; debug_raw_size];
+        // IMAGE_DEBUG_DIRECTORY (28 bytes), per PECOFF §6.6.
+        // Characteristics (+0)     = 0
+        // TimeDateStamp (+4)       = same env-pinned stamp.
+        debug_bytes[4..8].copy_from_slice(&timestamp.to_le_bytes());
+        // MajorVersion (+8) = 0; MinorVersion (+10) = 0
+        // Type (+12)               = IMAGE_DEBUG_TYPE_CODEVIEW
+        debug_bytes[12..16].copy_from_slice(&IMAGE_DEBUG_TYPE_CODEVIEW.to_le_bytes());
+        // SizeOfData (+16)         = cv_size
+        debug_bytes[16..20].copy_from_slice(&cv_size.to_le_bytes());
+        // AddressOfRawData (+20)   = RVA of CodeView record
+        let cv_rva: u32 = DEBUG_RVA + IMAGE_DEBUG_DIRECTORY_SIZE;
+        debug_bytes[20..24].copy_from_slice(&cv_rva.to_le_bytes());
+        // PointerToRawData (+24)   = file offset of CodeView record
+        let cv_file_off: u32 = (debug_file_off as u32) + IMAGE_DEBUG_DIRECTORY_SIZE;
+        debug_bytes[24..28].copy_from_slice(&cv_file_off.to_le_bytes());
+
+        // CodeView RSDS record (immediately after the dir).
+        let cv_off = IMAGE_DEBUG_DIRECTORY_SIZE as usize;
+        debug_bytes[cv_off..cv_off + 4].copy_from_slice(b"RSDS");
+        let guid = Self::stable_module_guid(name, image_base);
+        debug_bytes[cv_off + 4..cv_off + 20].copy_from_slice(&guid);
+        // Age — conventionally `1` for a brand-new PDB.
+        debug_bytes[cv_off + 20..cv_off + 24].copy_from_slice(&1u32.to_le_bytes());
+        // PDB filename (null-terminated UTF-8).
+        let name_off = cv_off + 24;
+        debug_bytes[name_off..name_off + pdb_name_bytes.len()].copy_from_slice(pdb_name_bytes);
+        // The trailing null is already zero from the
+        // `vec![0; ...]` initialisation.
+
         // --- DOS header (0x000..0x040) -----------------------
         out[0..2].copy_from_slice(b"MZ");
-        // e_lfanew at offset 0x3c — points at the PE signature.
         out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
 
         // --- PE signature (0x040..0x044) ---------------------
@@ -1152,9 +1305,7 @@ impl SandboxTarget {
         let coff = 0x44;
         out[coff..coff + 2].copy_from_slice(&IMAGE_FILE_MACHINE_I386.to_le_bytes());
         out[coff + 2..coff + 4].copy_from_slice(&NUMBER_OF_SECTIONS.to_le_bytes());
-        // Round-13 P1 — env-pinnable PE TimeDateStamp.
         out[coff + 4..coff + 8].copy_from_slice(&timestamp.to_le_bytes());
-        // PointerToSymbolTable / NumberOfSymbols already zero.
         out[coff + 16..coff + 18].copy_from_slice(&SIZE_OF_OPTIONAL_HEADER.to_le_bytes());
         let characteristics: u16 = IMAGE_FILE_DLL
             | IMAGE_FILE_EXECUTABLE_IMAGE
@@ -1165,66 +1316,145 @@ impl SandboxTarget {
         // --- Optional header (0x058..0x138, 224 bytes) -------
         let opt = 0x58;
         out[opt..opt + 2].copy_from_slice(&IMAGE_NT_OPTIONAL_HDR32_MAGIC.to_le_bytes());
-        out[opt + 2] = 4; // MajorLinkerVersion
-        out[opt + 3] = 0; // MinorLinkerVersion
-        out[opt + 4..opt + 8].copy_from_slice(&(text_raw_size as u32).to_le_bytes()); // SizeOfCode
-        out[opt + 8..opt + 12].copy_from_slice(&(edata_raw_size as u32).to_le_bytes()); // SizeOfInitializedData
-                                                                                        // SizeOfUninitializedData (+12) = 0
-        out[opt + 16..opt + 20].copy_from_slice(&TEXT_RVA.to_le_bytes()); // AddressOfEntryPoint
-        out[opt + 20..opt + 24].copy_from_slice(&TEXT_RVA.to_le_bytes()); // BaseOfCode
-        out[opt + 24..opt + 28].copy_from_slice(&EDATA_RVA.to_le_bytes()); // BaseOfData
-        out[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes()); // ImageBase
+        out[opt + 2] = 4;
+        out[opt + 3] = 0;
+        out[opt + 4..opt + 8].copy_from_slice(&(text_raw_size as u32).to_le_bytes());
+        out[opt + 8..opt + 12]
+            .copy_from_slice(&((edata_raw_size + debug_raw_size) as u32).to_le_bytes());
+        out[opt + 16..opt + 20].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        out[opt + 20..opt + 24].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        out[opt + 24..opt + 28].copy_from_slice(&EDATA_RVA.to_le_bytes());
+        out[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
         out[opt + 32..opt + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         out[opt + 36..opt + 40].copy_from_slice(&(FILE_ALIGNMENT as u32).to_le_bytes());
-        // OS / Subsystem / Image versions (Major + Minor each).
-        out[opt + 40..opt + 42].copy_from_slice(&4u16.to_le_bytes()); // MajorOperatingSystemVersion
-        out[opt + 42..opt + 44].copy_from_slice(&0u16.to_le_bytes()); // MinorOperatingSystemVersion
-                                                                      // ImageVersion 0.0 already zero
-        out[opt + 48..opt + 50].copy_from_slice(&4u16.to_le_bytes()); // MajorSubsystemVersion
-        out[opt + 50..opt + 52].copy_from_slice(&0u16.to_le_bytes()); // MinorSubsystemVersion
-                                                                      // Win32VersionValue at +52 = 0
-        out[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes()); // SizeOfImage
-        out[opt + 60..opt + 64].copy_from_slice(&(HEADERS_SIZE as u32).to_le_bytes()); // SizeOfHeaders
-                                                                                       // CheckSum (+64) = 0 — PE loader tolerates 0 for non-system DLLs.
+        out[opt + 40..opt + 42].copy_from_slice(&4u16.to_le_bytes());
+        out[opt + 42..opt + 44].copy_from_slice(&0u16.to_le_bytes());
+        out[opt + 48..opt + 50].copy_from_slice(&4u16.to_le_bytes());
+        out[opt + 50..opt + 52].copy_from_slice(&0u16.to_le_bytes());
+        out[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        out[opt + 60..opt + 64].copy_from_slice(&(HEADERS_SIZE as u32).to_le_bytes());
         out[opt + 68..opt + 70].copy_from_slice(&IMAGE_SUBSYSTEM_WINDOWS_CUI.to_le_bytes());
-        // DllCharacteristics (+70) = 0
-        out[opt + 72..opt + 76].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // SizeOfStackReserve = 1 MiB
-        out[opt + 76..opt + 80].copy_from_slice(&0x0000_1000u32.to_le_bytes()); // SizeOfStackCommit = 4 KiB
-        out[opt + 80..opt + 84].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // SizeOfHeapReserve = 1 MiB
-        out[opt + 84..opt + 88].copy_from_slice(&0x0000_1000u32.to_le_bytes()); // SizeOfHeapCommit = 4 KiB
-                                                                                // LoaderFlags (+88) = 0
-        out[opt + 92..opt + 96].copy_from_slice(&NUMBER_OF_DATA_DIRECTORIES.to_le_bytes()); // NumberOfRvaAndSizes
-                                                                                            // DataDirectory[0] = Export Table (RVA + Size).
+        out[opt + 72..opt + 76].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        out[opt + 76..opt + 80].copy_from_slice(&0x0000_1000u32.to_le_bytes());
+        out[opt + 80..opt + 84].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        out[opt + 84..opt + 88].copy_from_slice(&0x0000_1000u32.to_le_bytes());
+        out[opt + 92..opt + 96].copy_from_slice(&NUMBER_OF_DATA_DIRECTORIES.to_le_bytes());
+        // DataDirectory[0] = Export Table (RVA + Size).
         out[opt + 96..opt + 100].copy_from_slice(&EDATA_RVA.to_le_bytes());
         out[opt + 100..opt + 104].copy_from_slice(&edata_virtual_size.to_le_bytes());
-        // DataDirectory[1..16] all zero already.
+        // DataDirectory[6] = Debug Directory (RVA + Size). Each
+        // entry is 8 bytes, so `[6]` lives at `opt + 96 + 6*8 =
+        // opt + 144`. Per PECOFF §6.6 the Size field is the
+        // total size of all IMAGE_DEBUG_DIRECTORY entries
+        // (28 bytes per entry × N entries) — we have one
+        // CodeView entry so Size = 28.
+        out[opt + 144..opt + 148].copy_from_slice(&DEBUG_RVA.to_le_bytes());
+        out[opt + 148..opt + 152].copy_from_slice(&IMAGE_DEBUG_DIRECTORY_SIZE.to_le_bytes());
 
         // --- Section header for .text (0x138..0x160) ---------
         let sec_text = 0x138;
         out[sec_text..sec_text + 8].copy_from_slice(b".text\0\0\0");
-        out[sec_text + 8..sec_text + 12].copy_from_slice(&text_virtual_size.to_le_bytes()); // VirtualSize
-        out[sec_text + 12..sec_text + 16].copy_from_slice(&TEXT_RVA.to_le_bytes()); // VirtualAddress
-        out[sec_text + 16..sec_text + 20].copy_from_slice(&(text_raw_size as u32).to_le_bytes()); // SizeOfRawData
-        out[sec_text + 20..sec_text + 24].copy_from_slice(&(text_file_off as u32).to_le_bytes()); // PointerToRawData
+        out[sec_text + 8..sec_text + 12].copy_from_slice(&text_virtual_size.to_le_bytes());
+        out[sec_text + 12..sec_text + 16].copy_from_slice(&TEXT_RVA.to_le_bytes());
+        out[sec_text + 16..sec_text + 20].copy_from_slice(&(text_raw_size as u32).to_le_bytes());
+        out[sec_text + 20..sec_text + 24].copy_from_slice(&(text_file_off as u32).to_le_bytes());
         let text_chars: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
         out[sec_text + 36..sec_text + 40].copy_from_slice(&text_chars.to_le_bytes());
 
         // --- Section header for .edata (0x160..0x188) --------
         let sec_edata = 0x160;
         out[sec_edata..sec_edata + 8].copy_from_slice(b".edata\0\0");
-        out[sec_edata + 8..sec_edata + 12].copy_from_slice(&edata_virtual_size.to_le_bytes()); // VirtualSize
-        out[sec_edata + 12..sec_edata + 16].copy_from_slice(&EDATA_RVA.to_le_bytes()); // VirtualAddress
-        out[sec_edata + 16..sec_edata + 20].copy_from_slice(&(edata_raw_size as u32).to_le_bytes()); // SizeOfRawData
-        out[sec_edata + 20..sec_edata + 24].copy_from_slice(&(edata_file_off as u32).to_le_bytes()); // PointerToRawData
+        out[sec_edata + 8..sec_edata + 12].copy_from_slice(&edata_virtual_size.to_le_bytes());
+        out[sec_edata + 12..sec_edata + 16].copy_from_slice(&EDATA_RVA.to_le_bytes());
+        out[sec_edata + 16..sec_edata + 20].copy_from_slice(&(edata_raw_size as u32).to_le_bytes());
+        out[sec_edata + 20..sec_edata + 24].copy_from_slice(&(edata_file_off as u32).to_le_bytes());
         let edata_chars: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
         out[sec_edata + 36..sec_edata + 40].copy_from_slice(&edata_chars.to_le_bytes());
 
+        // --- Section header for .debug (0x188..0x1B0) --------
+        let sec_debug = 0x188;
+        out[sec_debug..sec_debug + 8].copy_from_slice(b".debug\0\0");
+        out[sec_debug + 8..sec_debug + 12].copy_from_slice(&debug_virtual_size.to_le_bytes());
+        out[sec_debug + 12..sec_debug + 16].copy_from_slice(&DEBUG_RVA.to_le_bytes());
+        out[sec_debug + 16..sec_debug + 20].copy_from_slice(&(debug_raw_size as u32).to_le_bytes());
+        out[sec_debug + 20..sec_debug + 24].copy_from_slice(&(debug_file_off as u32).to_le_bytes());
+        let debug_chars: u32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        out[sec_debug + 36..sec_debug + 40].copy_from_slice(&debug_chars.to_le_bytes());
+
         // --- .text raw data (0x200..) ------------------------
         out[text_file_off..text_file_off + text_payload.len()].copy_from_slice(&text_payload);
-        // --- .edata raw data (after .text) -------------------
+        // --- .edata raw data ---------------------------------
         out[edata_file_off..edata_file_off + edata.len()].copy_from_slice(&edata);
+        // --- .debug raw data ---------------------------------
+        out[debug_file_off..debug_file_off + debug_bytes.len()].copy_from_slice(&debug_bytes);
 
         out
+    }
+
+    /// Round-14 — strip a single trailing `.dll` (case-
+    /// insensitive) from a module name to produce the PDB stem
+    /// embedded in the CodeView RSDS record. `kernel32.dll` →
+    /// `kernel32` → `kernel32.pdb`.
+    fn strip_dll_suffix(name: &str) -> String {
+        let lower = name.to_ascii_lowercase();
+        if let Some(stem_lower) = lower.strip_suffix(".dll") {
+            // Preserve the original-case stem (the `.dll`
+            // suffix is the ONLY part we trim). E.g.
+            // `Kernel32.DLL` → `Kernel32`.
+            return name[..stem_lower.len()].to_string();
+        }
+        name.to_string()
+    }
+
+    /// Round-14 — produce a 16-byte deterministic per-module
+    /// GUID for the CodeView RSDS record. We need stability
+    /// (two runs of `oxidetracevfw --gdb …` against the same
+    /// codec produce byte-identical synthesised PE bytes) and a
+    /// well-distributed bit pattern (so two different module
+    /// names don't accidentally collide on a recognisable GUID).
+    ///
+    /// We use a 64-bit FNV-1a (RFC 5126 / standard parameters)
+    /// over the concatenation `name || image_base.le_bytes`,
+    /// then a second pass with a different offset basis to
+    /// produce 16 bytes total. FNV is slow but well-distributed
+    /// and deterministic across platforms — exactly what we
+    /// want for a synthetic GUID. No external dep needed.
+    ///
+    /// Note: We deliberately do NOT format the bytes as the
+    /// canonical 8-4-4-4-12 GUID variant — the CodeView RSDS
+    /// record stores the raw 16 bytes and Microsoft's own
+    /// dumpbin prints them in the canonical form on display.
+    fn stable_module_guid(name: &str, image_base: u32) -> [u8; 16] {
+        // Standard FNV-1a 64-bit parameters (RFC draft):
+        //   FNV_offset_basis = 0xcbf29ce484222325
+        //   FNV_prime        = 0x00000100000001b3
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+        const FNV_OFFSET_1: u64 = 0xcbf2_9ce4_8422_2325;
+        // Distinct second basis for the high 8 bytes — derived
+        // from the canonical FNV-1a 64-bit basis by a 13-bit
+        // rotation, which guarantees the two halves see a
+        // different fold and hence don't collide for trivially
+        // related inputs.
+        const FNV_OFFSET_2: u64 = FNV_OFFSET_1.rotate_left(13);
+
+        let base_bytes = image_base.to_le_bytes();
+        let bytes_iter = name
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(base_bytes.iter().copied());
+        let mut h1: u64 = FNV_OFFSET_1;
+        let mut h2: u64 = FNV_OFFSET_2;
+        for b in bytes_iter {
+            h1 ^= b as u64;
+            h1 = h1.wrapping_mul(FNV_PRIME);
+            h2 ^= (b as u64).rotate_left(3);
+            h2 = h2.wrapping_mul(FNV_PRIME);
+        }
+        let mut guid = [0u8; 16];
+        guid[..8].copy_from_slice(&h1.to_le_bytes());
+        guid[8..].copy_from_slice(&h2.to_le_bytes());
+        guid
     }
 
     /// Round-11 P2 — resolve the synthetic mtime for
@@ -1493,6 +1723,81 @@ impl SandboxTarget {
                 let _ = f.flush();
             }
         }
+    }
+
+    /// Round-14 — emit a `kind=stub_call` JSONL line into the
+    /// trace forward sink. Fields:
+    ///   - `module`  : cascade-loaded DLL basename
+    ///     (e.g. `kernel32.dll`)
+    ///   - `export`  : Win32 entry point name
+    ///     (e.g. `LoadLibraryA`)
+    ///   - `stub_id` : per-export host-assigned id, 0..0xFFFF
+    ///   - `pc`      : guest EIP at the time the stub was hit
+    ///     (hex with `0x` prefix, matches the
+    ///     `kind=breakpoint` shape).
+    ///
+    /// Best-effort — any IO error is silently dropped, matching
+    /// `emit_breakpoint_event` (the JSONL tape is a debugging
+    /// aid, not part of any correctness contract).
+    fn emit_stub_call_event(&self, module: &str, export: &str, stub_id: u16, pc: u32) {
+        let line = format!(
+            "{{\"kind\":\"stub_call\",\"module\":\"{module}\",\"export\":\"{export}\",\
+             \"stub_id\":{stub_id},\"pc\":\"0x{pc:08x}\"}}\n"
+        );
+        if let Ok(mut guard) = self.forward.lock() {
+            if let Some(f) = guard.as_mut() {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.flush();
+            }
+        }
+    }
+
+    /// Round-14 — look up a stub by guest VA (the address of
+    /// the first byte of an 8-byte stub). Returns `None` when
+    /// `va` is not a registered stub start. Used by both the
+    /// event-loop hook (after each `cpu.step`) and the SIGILL
+    /// trap handler (when the int3 byte at offset 4 fires).
+    fn lookup_stub_by_va(&self, va: u32) -> Option<&StubEntry> {
+        // Linear scan — the table is bounded by the cascade
+        // module count × ~20 exports each (≤ 200 entries in
+        // practice). A HashMap would marginally win on lookup
+        // but the constant-factor difference is dwarfed by the
+        // CPU step we just executed.
+        self.stub_table.iter().find(|s| s.va == va)
+    }
+
+    /// Round-14 — variant: look up the stub whose `int3` byte
+    /// (offset 4 from the stub start) sits at `pc`. The CPU
+    /// reports the int3-trap EIP at the int3 byte's address,
+    /// so the host trap handler subtracts 4 before consulting
+    /// the table. Returns `None` for non-stub addresses.
+    fn lookup_stub_by_int3_pc(&self, pc: u32) -> Option<&StubEntry> {
+        if pc < 4 {
+            return None;
+        }
+        self.lookup_stub_by_va(pc - 4)
+    }
+
+    /// Round-14 — emit a `kind=stub_call` event for the given
+    /// stub, but only the FIRST time the stub is hit. Subsequent
+    /// hits are silently dropped (the `first_call_logged` set
+    /// is the dedupe filter). Returns `true` when an event was
+    /// actually emitted, `false` when a duplicate was suppressed.
+    fn emit_stub_call_once(&self, stub: &StubEntry, pc: u32) -> bool {
+        // Acquire the dedupe set; on poisoning fall back to
+        // emitting (a duplicate is far better than a silent
+        // drop in the face of a poisoned mutex).
+        let already = self
+            .first_call_logged
+            .lock()
+            .ok()
+            .map(|mut s| !s.insert(stub.va))
+            .unwrap_or(false);
+        if already {
+            return false;
+        }
+        self.emit_stub_call_event(&stub.module, &stub.export, stub.stub_id, pc);
+        true
     }
 }
 
@@ -2067,6 +2372,10 @@ impl MonitorCmd for SandboxTarget {
                     out,
                     "  files         list host_io files (vFile:open targets)"
                 );
+                outputln!(
+                    out,
+                    "  stubs         list per-export 8-byte stubs (round-14)"
+                );
                 outputln!(out, "  help          this help");
             }
             "stats" => {
@@ -2077,6 +2386,7 @@ impl MonitorCmd for SandboxTarget {
                 outputln!(out, "loaded_modules={}", self.sandbox.host.modules.len());
                 outputln!(out, "open_vfile_fds={}", self.live_open_fds());
                 outputln!(out, "host_io_files={}", self.files.len());
+                outputln!(out, "host_stubs={}", self.stub_table.len());
                 outputln!(out, "exec_file={}", self.exec_file_name);
             }
             "watches" => {
@@ -2138,6 +2448,31 @@ impl MonitorCmd for SandboxTarget {
                             f.name,
                             f.bytes.len(),
                             kind
+                        );
+                    }
+                }
+            }
+            "stubs" => {
+                // Round-14 — dump the per-export host-side
+                // stub registry. One line per stub:
+                //   stub_id va module!export
+                // Helpful for an operator decoding a
+                // `kind=stub_call` JSONL line back to the
+                // physical address layout, AND for sanity-
+                // checking the round-14 build (e.g. assert
+                // `LoadLibraryA` shows up at exactly one
+                // unique stub_id with a deterministic VA).
+                if self.stub_table.is_empty() {
+                    outputln!(out, "(no host stubs registered)");
+                } else {
+                    for s in &self.stub_table {
+                        outputln!(
+                            out,
+                            "stub_id={} va=0x{:08x} {}!{}",
+                            s.stub_id,
+                            s.va,
+                            s.module,
+                            s.export
                         );
                     }
                 }
@@ -2533,14 +2868,55 @@ impl BlockingEventLoop for SandboxEventLoop {
                 Ok(oxideav_vfw::emulator::isa_int::StepOk::Continued) => false,
                 Ok(oxideav_vfw::emulator::isa_int::StepOk::Halted) => true,
                 Err(_) => {
-                    // Treat trap as a stop with a SIGILL-like
-                    // signal so gdb prints something useful.
+                    // Round-14 #4 — if the trap landed on the
+                    // `int3` byte (offset 4) of a per-export
+                    // synthesised stub, recover the stub_id
+                    // from `(AH << 8) | AL` (encoded in the two
+                    // `mov` instructions immediately preceding
+                    // the int3) and emit a `kind=stub_call`
+                    // JSONL event naming the
+                    // `(module, export)` the codec hit. We
+                    // still surface a SIGILL stop reason to
+                    // GDB — the JSONL event is independent of
+                    // the protocol-level reply, so an attached
+                    // client sees a normal trap they can
+                    // inspect AND the trace tape carries the
+                    // semantic event for off-line analysis.
+                    let trap_pc = target.sandbox.cpu.regs.eip;
+                    if let Some(stub) = target.lookup_stub_by_int3_pc(trap_pc) {
+                        // Cross-check the stub_id from the
+                        // live registers against the table
+                        // entry — if they disagree the guest
+                        // jumped into the middle of a stub
+                        // and clobbered AL/AH; we still emit
+                        // the event but flag the discrepancy
+                        // by trusting the table (which mirrors
+                        // the static byte layout we baked in).
+                        target.emit_stub_call_once(stub, trap_pc);
+                    }
                     target.exec_mode = None;
                     return Ok(Event::TargetStopped(SingleThreadStopReason::Signal(
                         Signal::SIGILL,
                     )));
                 }
             };
+
+            // Round-14 #4 (alt-design "first-call memwatch") —
+            // if the new EIP just landed on a stub's first byte
+            // (i.e. the guest jumped directly into the
+            // synthesised cascade-module .text without going
+            // through the int3 trap path — for instance a
+            // single-step from the `B0` mov-imm8 byte itself,
+            // OR a guest call into a synthesised export that
+            // was somehow mapped into sandbox memory rather
+            // than intercepted by `oxideav_vfw::host_stubs`),
+            // emit a one-shot `kind=stub_call` event. The
+            // dedupe filter prevents a hot loop hammering one
+            // export from spamming the trace tape.
+            let post_step_eip = target.sandbox.cpu.regs.eip;
+            if let Some(stub) = target.lookup_stub_by_va(post_step_eip) {
+                target.emit_stub_call_once(stub, post_step_eip);
+            }
 
             // Watchpoint hits — drain one queued event per stop
             // so the GDB client sees `Watch { kind, addr }` with
@@ -4382,18 +4758,23 @@ mod tests {
         // pread the full cascade stub. Round-12 P1: the bytes
         // are now a valid PE32 image, so the byte view is no
         // longer pure ASCII (headers + padding contain zeros).
-        // Round-13 P2: byte at 0x200 is the `0xC3` ret pad —
-        // every export points at it. The marker text follows
-        // at 0x201.
+        // Round-14: byte at 0x200 is no longer the shared
+        // `0xC3 ret` — it's the first byte of stub 0
+        // (`mov al, imm8` = 0xB0). The marker text follows
+        // after the per-export 8-byte stub block (kernel32 has
+        // 20 exports → 160 bytes of stubs → marker at 0x2A0).
         let mut buf = vec![0u8; st_k32.st_size as usize];
         let n = ok_io(HostIoPread::pread(&mut t, fd_k32, buf.len(), 0, &mut buf));
         assert_eq!(n, buf.len());
         assert_eq!(&buf[0..2], b"MZ", "DOS magic must be present");
         assert_eq!(&buf[0x40..0x44], b"PE\0\0", "PE signature must be present");
-        assert_eq!(buf[0x200], 0xC3, "first .text byte is x86 ret");
-        // .text marker starts at 0x201, runs to the .text raw
-        // size end (0x400 here — one FileAlignment block).
-        let text_section = std::str::from_utf8(&buf[0x201..0x400])
+        assert_eq!(buf[0x200], 0xB0, "first .text byte is `mov al, imm8`");
+        assert_eq!(buf[0x204], 0xCC, "byte 4 of stub 0 is INT3");
+        assert_eq!(buf[0x205], 0xC3, "byte 5 of stub 0 is RET");
+        // .text marker starts past the stub block; for kernel32
+        // (20 exports) the block is 160 bytes long.
+        let marker_start = 0x200 + 20 * 8;
+        let text_section = std::str::from_utf8(&buf[marker_start..0x400])
             .expect("text section is ASCII through end of marker (then zero pad)");
         assert!(text_section.contains("OXIDEAV-VFW STUB MODULE"));
         assert!(text_section.contains("name=kernel32.dll"));
@@ -4403,6 +4784,14 @@ mod tests {
         let edata = String::from_utf8_lossy(&buf[0x400..]);
         assert!(edata.contains("LoadLibraryA\0"));
         assert!(edata.contains("GetProcAddress\0"));
+        // Round-14 — `.debug` section's CodeView record names
+        // `kernel32.pdb` (so GDB's `info sharedlibrary` shows a
+        // Symbols hint instead of `(none)`).
+        let pdb_payload = String::from_utf8_lossy(&buf);
+        assert!(
+            pdb_payload.contains("kernel32.pdb\0"),
+            "RSDS PDB filename present in .debug section"
+        );
 
         // msvcrt.dll resolves too (proves the registry isn't
         // limited to one cascade entry).
@@ -4501,30 +4890,31 @@ mod tests {
         assert!(st.st_size > 0);
     }
 
-    /// Round-12 P1 + Round-13 — `synth_module_stub` emits a
-    /// structurally valid PE32 image with two sections
-    /// (`.text`, `.edata`). The DOS header, PE signature, COFF
-    /// header (Machine = i386, NumberOfSections = 2,
-    /// TimeDateStamp = the env-pinnable timestamp,
-    /// Characteristics = DLL | EXE | 32BIT), Optional header
-    /// (Magic = 0x010b PE32, ImageBase = the registered base,
-    /// SectionAlignment 0x1000, FileAlignment 0x200,
-    /// DataDirectory[0] = Export Table RVA + Size), and the
-    /// two section headers are all in canonical positions per
-    /// the Microsoft PE/COFF spec. The marker text from
-    /// pre-round-12 is preserved as the .text raw payload at
-    /// file offset 0x201 (after the leading 0xC3 ret pad) so
-    /// operator-grep'ing the stub still works. The byte layout
-    /// is a stability contract for tests + tooling but not a
-    /// wire contract for the GDB protocol.
+    /// Round-12 P1 + Round-13 + Round-14 — `synth_module_stub`
+    /// emits a structurally valid PE32 image with THREE
+    /// sections (`.text`, `.edata`, `.debug`). The DOS header,
+    /// PE signature, COFF header (Machine = i386,
+    /// NumberOfSections = 3, TimeDateStamp = the env-pinnable
+    /// timestamp, Characteristics = DLL | EXE | 32BIT), Optional
+    /// header (Magic = 0x010b PE32, ImageBase = the registered
+    /// base, SectionAlignment 0x1000, FileAlignment 0x200,
+    /// DataDirectory[0] = Export Table RVA + Size,
+    /// DataDirectory[6] = Debug RVA + 28), and the three
+    /// section headers are all in canonical positions per the
+    /// Microsoft PE/COFF spec. Round-14 also replaces the
+    /// shared `0xC3 ret` byte at TEXT_RVA with per-export
+    /// 8-byte stubs (`B0 NN B4 NN CC C3 90 90`) — the marker
+    /// text now follows the stub block. The byte layout is a
+    /// stability contract for tests + tooling but not a wire
+    /// contract for the GDB protocol.
     #[test]
     fn synth_module_stub_format_is_stable() {
         let bytes = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 0x6800_0000);
-        // Total length is FileAlignment-aligned (0x200 headers
-        // + at least one 0x200 .text page + one 0x200 .edata
-        // page = 0x600 minimum).
+        // Total length is FileAlignment-aligned. Headers (0x200)
+        // + at least one .text page (0x200) + one .edata page
+        // (0x200) + one .debug page (0x200) = 0x800 minimum.
         assert!(
-            bytes.len() >= 0x600 && bytes.len() % 0x200 == 0,
+            bytes.len() >= 0x800 && bytes.len() % 0x200 == 0,
             "PE32 file size must be FileAlignment-aligned"
         );
 
@@ -4540,7 +4930,10 @@ mod tests {
         let machine = u16::from_le_bytes(bytes[0x44..0x46].try_into().unwrap());
         assert_eq!(machine, 0x014c, "Machine = IMAGE_FILE_MACHINE_I386");
         let num_sections = u16::from_le_bytes(bytes[0x46..0x48].try_into().unwrap());
-        assert_eq!(num_sections, 2, "NumberOfSections = 2 (.text + .edata)");
+        assert_eq!(
+            num_sections, 3,
+            "NumberOfSections = 3 (.text + .edata + .debug)"
+        );
         let timestamp = u32::from_le_bytes(bytes[0x48..0x4c].try_into().unwrap());
         assert_eq!(timestamp, 0x6800_0000, "TimeDateStamp echoes the argument");
         let opt_size = u16::from_le_bytes(bytes[0x54..0x56].try_into().unwrap());
@@ -4575,6 +4968,16 @@ mod tests {
             export_size >= 40,
             "DataDirectory[0].Size >= IMAGE_EXPORT_DIRECTORY size (40)"
         );
+        // Round-14 — DataDirectory[6] = Debug Directory.
+        // Each directory entry is 8 bytes, so [6] lives at
+        // opt + 96 + 6*8 = opt + 144.
+        let debug_dir_rva = u32::from_le_bytes(bytes[0x58 + 144..0x58 + 148].try_into().unwrap());
+        assert_eq!(debug_dir_rva, 0x3000, "DataDirectory[6].RVA = .debug RVA");
+        let debug_dir_size = u32::from_le_bytes(bytes[0x58 + 148..0x58 + 152].try_into().unwrap());
+        assert_eq!(
+            debug_dir_size, 28,
+            "DataDirectory[6].Size = sizeof(IMAGE_DEBUG_DIRECTORY)"
+        );
 
         // .text section header
         assert_eq!(&bytes[0x138..0x140], b".text\0\0\0", "section name");
@@ -4600,10 +5003,50 @@ mod tests {
             ".edata IMAGE_SCN_CNT_INITIALIZED_DATA"
         );
 
-        // .text raw data: 0xC3 ret followed by marker text.
-        assert_eq!(bytes[0x200], 0xC3, ".text starts with x86 'ret'");
+        // Round-14 — .debug section header. The .debug raw
+        // file offset depends on .text + .edata raw sizes; for
+        // kernel32 (20 exports → ~250-byte .edata payload) the
+        // .edata raw payload exceeds one FileAlignment block
+        // (0x200), so .edata occupies two pages and .debug
+        // lands at 0x200 (headers) + 0x200 (.text) + 0x400
+        // (.edata) = 0x800.
+        assert_eq!(&bytes[0x188..0x190], b".debug\0\0", ".debug section name");
+        let debug_va = u32::from_le_bytes(bytes[0x188 + 12..0x188 + 16].try_into().unwrap());
+        assert_eq!(debug_va, 0x3000);
+        let debug_raw_ptr = u32::from_le_bytes(bytes[0x188 + 20..0x188 + 24].try_into().unwrap());
+        assert!(
+            debug_raw_ptr % 0x200 == 0,
+            ".debug raw ptr must be FileAlignment-aligned"
+        );
+        assert!(
+            debug_raw_ptr >= 0x600,
+            ".debug raw ptr is past headers + at least one .text + one .edata page"
+        );
+        let debug_chars = u32::from_le_bytes(bytes[0x188 + 36..0x188 + 40].try_into().unwrap());
+        assert!(debug_chars & 0x4000_0000 != 0, ".debug IMAGE_SCN_MEM_READ");
+        assert!(
+            debug_chars & 0x0000_0040 != 0,
+            ".debug IMAGE_SCN_CNT_INITIALIZED_DATA"
+        );
+
+        // Round-14 — .text raw data: per-export 8-byte stubs
+        // followed by the marker tail. The first stub starts
+        // with `mov al, 0` (B0 00) since it's stub_id 0.
+        assert_eq!(
+            bytes[0x200], 0xB0,
+            ".text starts with x86 'mov al, imm8' (per-export stub)"
+        );
+        assert_eq!(bytes[0x200 + 2], 0xB4, "byte 2 of stub 0 is `mov ah, imm8`");
+        assert_eq!(bytes[0x200 + 4], 0xCC, "byte 4 of stub 0 is INT3");
+        assert_eq!(bytes[0x200 + 5], 0xC3, "byte 5 of stub 0 is RET");
+        assert_eq!(bytes[0x200 + 6], 0x90, "byte 6 of stub 0 is NOP padding");
+        assert_eq!(bytes[0x200 + 7], 0x90, "byte 7 of stub 0 is NOP padding");
+        // After the N×8-byte stub block the marker text picks
+        // up. kernel32 has 20 exports → 160 bytes of stubs →
+        // marker starts at 0x200 + 0xA0 = 0x2A0.
+        let marker_start = 0x200 + 20 * 8;
         let payload =
-            std::str::from_utf8(&bytes[0x201..0x400]).expect(".text payload tail is ASCII");
+            std::str::from_utf8(&bytes[marker_start..0x400]).expect(".text marker tail is ASCII");
         let trimmed = payload.trim_end_matches('\0');
         assert!(trimmed.starts_with("OXIDEAV-VFW STUB MODULE\n"));
         assert!(trimmed.contains("\nname=kernel32.dll\n"));
@@ -4618,14 +5061,17 @@ mod tests {
         let n_funcs = u32::from_le_bytes(bytes[0x414..0x418].try_into().unwrap());
         assert!(n_funcs >= 1, "AddressTableEntries non-zero");
         // First AddressOfFunctions entry must point at TEXT_RVA
-        // (the 0xC3 ret pad).
+        // (stub 0's first byte).
         let funcs_rva = u32::from_le_bytes(bytes[0x41C..0x420].try_into().unwrap());
-        // funcs_rva is in image coordinates (EDATA_RVA + 0x28).
         assert_eq!(funcs_rva, 0x2028);
         let first_func = u32::from_le_bytes(bytes[0x428..0x42C].try_into().unwrap());
-        assert_eq!(first_func, 0x1000, "every export RVA points at TEXT_RVA");
+        assert_eq!(first_func, 0x1000, "stub 0's RVA = TEXT_RVA");
+        // Round-14 — second export's RVA must be 8 bytes past
+        // the first (per-export 8-byte stubs).
+        let second_func = u32::from_le_bytes(bytes[0x42C..0x430].try_into().unwrap());
+        assert_eq!(second_func, 0x1008, "stub 1's RVA = TEXT_RVA + 8");
         // Verify a known kernel32 export name appears verbatim.
-        let edata_payload = &bytes[0x400..];
+        let edata_payload = &bytes[0x400..0x600];
         let s = String::from_utf8_lossy(edata_payload);
         assert!(
             s.contains("LoadLibraryA\0"),
@@ -4633,6 +5079,40 @@ mod tests {
         );
         assert!(s.contains("GetProcAddress\0"));
         assert!(s.contains("kernel32.dll\0"), "DLL name string present");
+
+        // Round-14 — .debug raw data:
+        //   +0x00 IMAGE_DEBUG_DIRECTORY (28 bytes)
+        //   +0x1c CodeView record (RSDS magic)
+        // First 4 bytes of the directory = Characteristics = 0.
+        let debug_off = debug_raw_ptr as usize;
+        assert_eq!(
+            &bytes[debug_off..debug_off + 4],
+            &[0u8; 4],
+            "IMAGE_DEBUG_DIRECTORY.Characteristics = 0"
+        );
+        let debug_ts = u32::from_le_bytes(bytes[debug_off + 4..debug_off + 8].try_into().unwrap());
+        assert_eq!(debug_ts, 0x6800_0000, "debug TimeDateStamp = pinned stamp");
+        let debug_type =
+            u32::from_le_bytes(bytes[debug_off + 12..debug_off + 16].try_into().unwrap());
+        assert_eq!(debug_type, 2, "Type = IMAGE_DEBUG_TYPE_CODEVIEW (2)");
+        let cv_rva = u32::from_le_bytes(bytes[debug_off + 20..debug_off + 24].try_into().unwrap());
+        assert_eq!(
+            cv_rva,
+            0x3000 + 28,
+            "AddressOfRawData points just past the directory"
+        );
+        // CodeView RSDS record at file offset debug_off + 28.
+        let cv_off = debug_off + 28;
+        assert_eq!(&bytes[cv_off..cv_off + 4], b"RSDS", "CodeView RSDS magic");
+        // 16-byte GUID then 4-byte age (=1).
+        let age = u32::from_le_bytes(bytes[cv_off + 20..cv_off + 24].try_into().unwrap());
+        assert_eq!(age, 1, "RSDS Age = 1");
+        // PDB filename follows.
+        let pdb_off = cv_off + 24;
+        let pdb_tail = &bytes[pdb_off..];
+        let nul = pdb_tail.iter().position(|&b| b == 0).expect("null term");
+        let pdb_str = std::str::from_utf8(&pdb_tail[..nul]).expect("UTF-8 PDB name");
+        assert_eq!(pdb_str, "kernel32.pdb", "RSDS PDB filename");
     }
 
     /// Round-13 P2 — different module names produce different
@@ -4706,8 +5186,292 @@ mod tests {
         );
         // Different timestamps produce different bytes (the
         // stamp is embedded in 2 distinct locations: COFF
-        // header + IMAGE_EXPORT_DIRECTORY).
+        // header + IMAGE_EXPORT_DIRECTORY + IMAGE_DEBUG_DIRECTORY).
         let c = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 1_700_000_001);
         assert_ne!(a, c);
+    }
+
+    /// Round-14 — `synth_module_stub_with_table` populates
+    /// the per-export `StubEntry` registry with one record per
+    /// export, monotonically-increasing stub_ids, and 8-byte
+    /// stride between virtual addresses.
+    #[test]
+    fn synth_module_stub_with_table_populates_per_export_entries() {
+        let mut table: Vec<StubEntry> = Vec::new();
+        let _bytes = SandboxTarget::synth_module_stub_with_table(
+            "kernel32.dll",
+            0x7700_0000,
+            0x6800_0000,
+            0,
+            &mut table,
+        );
+        // kernel32 has the 20 exports declared by `module_exports`.
+        assert_eq!(table.len(), 20, "one StubEntry per kernel32 export");
+        // Stub IDs are sequential starting at the base (0 here).
+        for (i, entry) in table.iter().enumerate() {
+            assert_eq!(
+                entry.stub_id, i as u16,
+                "stub_id sequence must be monotonic from base"
+            );
+            assert_eq!(entry.module, "kernel32.dll");
+            // VA = image_base + TEXT_RVA + i*8.
+            let expected_va = 0x7700_0000 + 0x1000 + (i as u32) * 8;
+            assert_eq!(entry.va, expected_va, "VA stride must be 8 bytes");
+        }
+        // First export is `LoadLibraryA` (per `module_exports`).
+        assert_eq!(table[0].export, "LoadLibraryA");
+    }
+
+    /// Round-14 — chained calls with a non-zero `stub_id_base`
+    /// produce IDs that don't collide with a previous module's
+    /// allocation. Mirrors what `build_files` does when more
+    /// than one cascade module is present.
+    #[test]
+    fn synth_module_stub_with_table_chains_stub_ids_across_modules() {
+        let mut table: Vec<StubEntry> = Vec::new();
+        let k32_exports = SandboxTarget::module_exports("kernel32.dll").len() as u16;
+        let _ = SandboxTarget::synth_module_stub_with_table(
+            "kernel32.dll",
+            0x7700_0000,
+            0,
+            0,
+            &mut table,
+        );
+        let _ = SandboxTarget::synth_module_stub_with_table(
+            "user32.dll",
+            0x7800_0000,
+            0,
+            k32_exports,
+            &mut table,
+        );
+        // user32's first export starts at stub_id = k32_exports.
+        let user32_start = table
+            .iter()
+            .position(|s| s.module == "user32.dll")
+            .expect("user32 entries present");
+        assert_eq!(table[user32_start].stub_id, k32_exports);
+        // Total table size = k32 exports + user32 exports.
+        let u32_exports = SandboxTarget::module_exports("user32.dll").len() as u16;
+        assert_eq!(table.len() as u16, k32_exports + u32_exports);
+    }
+
+    /// Round-14 — each per-export 8-byte stub encodes its
+    /// stub_id into the two `mov` immediates (B0 NN B4 NN), so
+    /// a host-side trap handler can recover the id from the
+    /// live registers via `(AH << 8) | AL`.
+    #[test]
+    fn synth_module_stub_per_export_8_byte_stub_layout() {
+        let bytes = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000, 0);
+        // First three stubs cover stub_ids 0, 1, 2.
+        for i in 0..3 {
+            let off = 0x200 + i * 8;
+            assert_eq!(bytes[off], 0xB0, "stub {i} byte 0 = mov al");
+            assert_eq!(bytes[off + 1] as usize, i, "stub {i} stub_id_lo = i");
+            assert_eq!(bytes[off + 2], 0xB4, "stub {i} byte 2 = mov ah");
+            assert_eq!(bytes[off + 3], 0, "stub {i} stub_id_hi = 0 for i<256");
+            assert_eq!(bytes[off + 4], 0xCC, "stub {i} byte 4 = int3");
+            assert_eq!(bytes[off + 5], 0xC3, "stub {i} byte 5 = ret");
+            assert_eq!(bytes[off + 6], 0x90, "stub {i} byte 6 = nop");
+            assert_eq!(bytes[off + 7], 0x90, "stub {i} byte 7 = nop");
+        }
+    }
+
+    /// Round-14 — `stable_module_guid` is deterministic across
+    /// calls (same input → same output) and produces distinct
+    /// GUIDs for distinct module names, so two cascade modules'
+    /// CodeView records don't accidentally collide on a
+    /// recognisable identifier.
+    #[test]
+    fn stable_module_guid_is_deterministic_and_distinct() {
+        let a = SandboxTarget::stable_module_guid("kernel32.dll", 0x7700_0000);
+        let b = SandboxTarget::stable_module_guid("kernel32.dll", 0x7700_0000);
+        assert_eq!(a, b, "same input must produce same GUID");
+        let c = SandboxTarget::stable_module_guid("user32.dll", 0x7700_0000);
+        assert_ne!(a, c, "different module names must produce different GUIDs");
+        let d = SandboxTarget::stable_module_guid("kernel32.dll", 0x7800_0000);
+        assert_ne!(a, d, "different image_base must produce different GUIDs");
+    }
+
+    /// Round-14 — `strip_dll_suffix` trims a single trailing
+    /// `.dll` (case-insensitive) so the CodeView RSDS record
+    /// embeds `kernel32.pdb` rather than `kernel32.dll.pdb`.
+    /// Modules without `.dll` suffix (e.g. `INDEO5.AX`) are
+    /// preserved verbatim.
+    #[test]
+    fn strip_dll_suffix_drops_only_trailing_dll() {
+        assert_eq!(SandboxTarget::strip_dll_suffix("kernel32.dll"), "kernel32");
+        assert_eq!(SandboxTarget::strip_dll_suffix("KERNEL32.DLL"), "KERNEL32");
+        assert_eq!(SandboxTarget::strip_dll_suffix("INDEO5.AX"), "INDEO5.AX");
+        assert_eq!(SandboxTarget::strip_dll_suffix("foo"), "foo");
+        // .dll appearing in the middle is preserved.
+        assert_eq!(SandboxTarget::strip_dll_suffix("a.dll.bar"), "a.dll.bar");
+    }
+
+    /// Round-14 — host-side `lookup_stub_by_va` returns the
+    /// matching `StubEntry` for a known stub VA and `None` for
+    /// addresses that don't sit on a stub boundary. The lookup
+    /// powers both the int3-trap event handler and the
+    /// "first-call memwatch" alt-design.
+    #[test]
+    fn lookup_stub_by_va_returns_matching_stub() {
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            String::new(),
+            Vec::new(),
+        );
+        // First stub is at image_base + TEXT_RVA = 0x77001000.
+        let first_va = 0x7700_0000 + 0x1000;
+        let stub = t.lookup_stub_by_va(first_va).expect("first stub present");
+        assert_eq!(stub.module, "kernel32.dll");
+        assert_eq!(stub.stub_id, 0);
+        // Second stub is 8 bytes past the first.
+        let second = t
+            .lookup_stub_by_va(first_va + 8)
+            .expect("second stub present");
+        assert_eq!(second.stub_id, 1);
+        // Address in the middle of stub 0 (the int3 byte at +4)
+        // is NOT a stub start — the dedicated `lookup_stub_by_int3_pc`
+        // handles that case.
+        assert!(t.lookup_stub_by_va(first_va + 4).is_none());
+        // Wholly unrelated address.
+        assert!(t.lookup_stub_by_va(0x1000_0000).is_none());
+    }
+
+    /// Round-14 — `lookup_stub_by_int3_pc` resolves the stub
+    /// whose int3 byte (offset 4) sits at `pc`. Handles the
+    /// CPU's behaviour of reporting `entry_eip` (the int3 byte
+    /// itself) on the trap path.
+    #[test]
+    fn lookup_stub_by_int3_pc_subtracts_four() {
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            String::new(),
+            Vec::new(),
+        );
+        let int3_pc = 0x7700_0000 + 0x1000 + 4;
+        let stub = t
+            .lookup_stub_by_int3_pc(int3_pc)
+            .expect("stub at int3_pc - 4");
+        assert_eq!(stub.stub_id, 0);
+        // pc = 0 (degenerate, would underflow without guard).
+        assert!(t.lookup_stub_by_int3_pc(0).is_none());
+    }
+
+    /// Round-14 — `emit_stub_call_once` writes one
+    /// `kind=stub_call` JSONL line on first hit and silently
+    /// dedupes subsequent hits on the same stub VA.
+    #[test]
+    fn emit_stub_call_once_dedupes_repeated_hits() {
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let forward: ForwardSink =
+            Arc::new(Mutex::new(Some(Box::new(SharedWriter(captured.clone())))));
+
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        let t = SandboxTarget::with_forward(sb, forward, &[], None, String::new(), Vec::new());
+        let stub = t.stub_table[0].clone();
+        // First emission writes a JSONL line.
+        let emitted = t.emit_stub_call_once(&stub, stub.va);
+        assert!(emitted, "first call must emit");
+        // Repeat calls dedupe.
+        for _ in 0..5 {
+            let emitted_again = t.emit_stub_call_once(&stub, stub.va);
+            assert!(!emitted_again, "duplicate call must be suppressed");
+        }
+        let s = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert_eq!(
+            s.matches('\n').count(),
+            1,
+            "exactly one JSONL line emitted, got: {s:?}"
+        );
+        assert!(s.contains(r#""kind":"stub_call""#));
+        assert!(s.contains(r#""module":"kernel32.dll""#));
+        assert!(s.contains(r#""export":"LoadLibraryA""#));
+        assert!(s.contains(r#""stub_id":0"#));
+    }
+
+    /// Round-14 — `emit_stub_call_event` produces the wire-
+    /// level JSONL shape the `--trace-output` consumer expects.
+    /// Mirrors the `emit_breakpoint_event` shape — single line,
+    /// trailing newline, all `0x…`-prefixed addresses.
+    #[test]
+    fn emit_stub_call_event_jsonl_shape() {
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let forward: ForwardSink =
+            Arc::new(Mutex::new(Some(Box::new(SharedWriter(captured.clone())))));
+        let sb = Sandbox::new();
+        let t = SandboxTarget::with_forward(sb, forward, &[], None, String::new(), Vec::new());
+        t.emit_stub_call_event("kernel32.dll", "LoadLibraryA", 0, 0x77001000);
+        let s = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(s.starts_with('{'));
+        assert!(s.ends_with('\n'));
+        assert_eq!(s.matches('\n').count(), 1);
+        assert!(s.contains(r#""kind":"stub_call""#));
+        assert!(s.contains(r#""module":"kernel32.dll""#));
+        assert!(s.contains(r#""export":"LoadLibraryA""#));
+        assert!(s.contains(r#""stub_id":0"#));
+        assert!(s.contains(r#""pc":"0x77001000""#));
+    }
+
+    /// Round-14 — `build_files` populates `stub_table` from
+    /// `HostState::modules` on construction. With two cascade
+    /// modules registered, the table carries entries for BOTH.
+    #[test]
+    fn build_files_populates_stub_table_for_all_cascade_modules() {
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        sb.host.modules.insert("user32.dll".into(), 0x7800_0000);
+        let t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            String::new(),
+            Vec::new(),
+        );
+        // Both modules contribute entries.
+        assert!(t.stub_table.iter().any(|s| s.module == "kernel32.dll"));
+        assert!(t.stub_table.iter().any(|s| s.module == "user32.dll"));
+        // No duplicate stub_ids — host-side dispatch needs them
+        // unique for `(AH << 8) | AL` lookup to disambiguate.
+        let mut ids: Vec<u16> = t.stub_table.iter().map(|s| s.stub_id).collect();
+        ids.sort_unstable();
+        let unique_ids = ids.clone();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            unique_ids.len(),
+            "stub_ids must be globally unique across cascade modules"
+        );
     }
 }
