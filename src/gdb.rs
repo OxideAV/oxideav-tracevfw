@@ -54,8 +54,13 @@ use gdbstub::target::ext::breakpoints::{
     WatchKind,
 };
 use gdbstub::target::ext::exec_file::{ExecFile, ExecFileOps};
+use gdbstub::target::ext::host_io::{
+    HostIo, HostIoClose, HostIoCloseOps, HostIoErrno, HostIoError, HostIoOpen, HostIoOpenFlags,
+    HostIoOpenMode, HostIoOpenOps, HostIoOps, HostIoPread, HostIoPreadOps, HostIoResult,
+};
 use gdbstub::target::ext::libraries::{Libraries, LibrariesOps};
 use gdbstub::target::ext::memory_map::{MemoryMap, MemoryMapOps};
+use gdbstub::target::ext::monitor_cmd::{outputln, ConsoleOutput, MonitorCmd, MonitorCmdOps};
 use gdbstub::target::ext::target_description_xml_override::{
     TargetDescriptionXmlOverride, TargetDescriptionXmlOverrideOps,
 };
@@ -192,8 +197,14 @@ pub fn run_gdb_server(
         }
         None => Arc::new(Mutex::new(None)),
     };
-    let mut target =
-        SandboxTarget::with_forward(sandbox, forward, cli_breakpoints, image, name.clone());
+    let mut target = SandboxTarget::with_forward(
+        sandbox,
+        forward,
+        cli_breakpoints,
+        image,
+        name.clone(),
+        bytes,
+    );
     let connection: Box<dyn ConnectionExt<Error = std::io::Error>> = Box::new(stream);
     let stub = GdbStub::new(connection);
 
@@ -586,6 +597,33 @@ pub struct SandboxTarget {
     /// PE image is available. Built eagerly at `with_forward`
     /// construction time by [`SandboxTarget::build_auxv_blob`].
     auxv_blob: Vec<u8>,
+    /// Round-10 P2 — raw bytes of the codec DLL/AX file the
+    /// operator passed on the CLI, retained so the round-10
+    /// `vFile:open`/`vFile:pread`/`vFile:close` host_io extension
+    /// can serve the file back to a connected GDB client. A
+    /// remote GDB session that runs
+    /// `add-symbol-file remote:<basename>` then triggers a
+    /// `vFile:open` for that name; we match by basename and
+    /// hand back the in-memory bytes paginated. Empty
+    /// (`Vec::new()`) when no file was passed (e.g. tests that
+    /// build a bare sandbox); the `support_host_io` predicate
+    /// gates the extension on non-empty so gdbstub doesn't
+    /// advertise a feature we'd answer with `ENOENT`.
+    dll_bytes: Vec<u8>,
+    /// Round-10 P2 — open `vFile:open` file descriptors. Each
+    /// successful `vFile:open` allocates a new `u32` fd that
+    /// indexes into this vector; `vFile:pread` looks the entry
+    /// up + slices into [`Self::dll_bytes`]; `vFile:close`
+    /// nulls the entry. We never deallocate fully so a stale
+    /// `vFile:pread` after `close` returns `EBADF` rather than
+    /// silently aliasing onto a future `open`. The shape is
+    /// `Vec<Option<()>>` rather than `Vec<bool>` so a future
+    /// expansion to multi-file (e.g. opening the codec's
+    /// cascade-loaded DLLs) can carry per-fd state without a
+    /// schema break. fd value 0 is reserved (POSIX stdin) so we
+    /// always start allocations at 1; lookup uses
+    /// `fd as usize - 1`.
+    open_files: Vec<Option<()>>,
 }
 
 impl SandboxTarget {
@@ -605,6 +643,7 @@ impl SandboxTarget {
             &[],
             None,
             String::new(),
+            Vec::new(),
         )
     }
 
@@ -628,6 +667,7 @@ impl SandboxTarget {
         cli_breakpoints: &[u32],
         image: Option<Image>,
         exec_file_name: String,
+        dll_bytes: Vec<u8>,
     ) -> Self {
         let watch_queue: WatchHitQueue = Arc::new(Mutex::new(VecDeque::new()));
         let sink = WatchSink::new(watch_queue.clone(), forward.clone());
@@ -677,6 +717,8 @@ impl SandboxTarget {
             exec_file_name,
             library_list_xml,
             auxv_blob,
+            dll_bytes,
+            open_files: Vec::new(),
         }
     }
 
@@ -1013,6 +1055,57 @@ impl Target for SandboxTarget {
     /// `getauxval(3)` for the AT_* key semantics.
     fn support_auxv(&mut self) -> Option<AuxvOps<'_, Self>> {
         if self.auxv_blob.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    /// Round-10 P1 — advertise `qRcmd` (the GDB `monitor`
+    /// command) so an operator at a connected GDB prompt can
+    /// introspect sandbox state without leaving the debugger.
+    /// We surface the four most operator-useful pieces of
+    /// state as monitor commands:
+    ///
+    /// - `monitor stats` — instruction count, sw breakpoints
+    ///   count, hw watchpoints count, loaded modules count,
+    ///   open vFile fds count.
+    /// - `monitor watches` — one line per registered hw
+    ///   watchpoint (`addr len kind`).
+    /// - `monitor breakpoints` — one line per registered sw
+    ///   breakpoint (PC). Includes both client-installed
+    ///   `Z0`-packet breakpoints and CLI `--break` ones.
+    /// - `monitor modules` — one line per loaded module
+    ///   (`name image_base`), mirroring what
+    ///   `qXfer:libraries:read` shows but human-readable.
+    /// - `monitor help` — list of known commands.
+    ///
+    /// The extension is always available — these queries do
+    /// not depend on a loaded image. See the GDB protocol
+    /// manual §"qRcmd" for the wire-level contract: payload
+    /// is hex-decoded by gdbstub before reaching our
+    /// `handle_monitor_cmd` impl, output is hex-encoded back
+    /// over the wire by the `outputln!` / `output!` macros.
+    fn support_monitor_cmd(&mut self) -> Option<MonitorCmdOps<'_, Self>> {
+        Some(self)
+    }
+
+    /// Round-10 P2 — advertise the host_io extension
+    /// (`vFile:open` / `vFile:pread` / `vFile:close`) so a
+    /// connected GDB client can `add-symbol-file remote:<NAME>`
+    /// to fetch the codec DLL bytes back over the wire and
+    /// resolve symbols in the loaded image. The fileserver
+    /// only knows one file — the codec DLL the operator passed
+    /// on the CLI — and matches by basename. Other paths
+    /// resolve to `ENOENT`. Returns `None` when no DLL bytes
+    /// were retained (e.g. the test-only `SandboxTarget::new`
+    /// shorthand) so gdbstub cleanly reports "unsupported"
+    /// rather than answering every `open` with `ENOENT`. See
+    /// the GDB RSP manual §"Host I/O Packets" for the wire
+    /// contract:
+    /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Host-I_002fO-Packets.html>
+    fn support_host_io(&mut self) -> Option<HostIoOps<'_, Self>> {
+        if self.dll_bytes.is_empty() {
             None
         } else {
             Some(self)
@@ -1378,6 +1471,235 @@ impl Auxv for SandboxTarget {
     }
 }
 
+impl MonitorCmd for SandboxTarget {
+    /// Round-10 P1 — handle a `monitor <cmd>` packet from a
+    /// connected GDB client. The first whitespace-separated
+    /// token is the command name; remaining tokens are
+    /// arguments (currently only `help` consumes them, by
+    /// ignoring them). Output goes back to the GDB console via
+    /// the `outputln!` macro.
+    ///
+    /// Unknown commands respond with `unknown monitor command:
+    /// <cmd>; try 'monitor help'` so the operator gets a hint
+    /// instead of silent failure. UTF-8 decoding is best-effort
+    /// per the GDB protocol contract — the `cmd` payload is
+    /// already hex-decoded into bytes by gdbstub before
+    /// reaching here, but the spec doesn't mandate UTF-8.
+    fn handle_monitor_cmd(
+        &mut self,
+        cmd: &[u8],
+        mut out: ConsoleOutput<'_>,
+    ) -> Result<(), Self::Error> {
+        // Lossy UTF-8: monitor commands are always typed by a
+        // human at a `(gdb)` prompt so non-UTF-8 is a malformed
+        // request we can flag with an unknown-command reply.
+        let cmd_str = String::from_utf8_lossy(cmd);
+        let trimmed = cmd_str.trim();
+        // First token is the command name; we don't use args
+        // for any of the round-10 commands but split for
+        // future-proofing (e.g. `monitor watches add 0x… 4 r`
+        // could land in a later round).
+        let mut parts = trimmed.split_whitespace();
+        let head = parts.next().unwrap_or("");
+        match head {
+            "" => {
+                outputln!(out, "(empty monitor command; try 'monitor help')");
+            }
+            "help" => {
+                outputln!(out, "oxidetracevfw monitor commands:");
+                outputln!(out, "  stats         sandbox + GDB-state counters");
+                outputln!(out, "  watches       list registered HW watchpoints");
+                outputln!(out, "  breakpoints   list registered SW breakpoints");
+                outputln!(out, "  modules       list loaded PE modules");
+                outputln!(out, "  help          this help");
+            }
+            "stats" => {
+                outputln!(out, "instr_count={}", self.sandbox.cpu.instr_count);
+                outputln!(out, "sw_breakpoints={}", self.sw_bps.len());
+                outputln!(out, "cli_breakpoints={}", self.cli_breakpoints.len());
+                outputln!(out, "hw_watchpoints={}", self.hw_watches.len());
+                outputln!(out, "loaded_modules={}", self.sandbox.host.modules.len());
+                outputln!(out, "open_vfile_fds={}", self.live_open_fds());
+                outputln!(out, "exec_file={}", self.exec_file_name);
+            }
+            "watches" => {
+                if self.hw_watches.is_empty() {
+                    outputln!(out, "(no HW watchpoints registered)");
+                } else {
+                    for w in &self.hw_watches {
+                        let kind = match w.kind {
+                            WatchKind::Read => "r",
+                            WatchKind::Write => "w",
+                            WatchKind::ReadWrite => "rw",
+                        };
+                        outputln!(out, "0x{:08x} len={} kind={}", w.addr, w.len, kind);
+                    }
+                }
+            }
+            "breakpoints" => {
+                if self.sw_bps.is_empty() {
+                    outputln!(out, "(no SW breakpoints registered)");
+                } else {
+                    for pc in &self.sw_bps {
+                        let tag = if self.cli_breakpoints.contains(pc) {
+                            " (cli)"
+                        } else {
+                            ""
+                        };
+                        outputln!(out, "0x{:08x}{}", pc, tag);
+                    }
+                }
+            }
+            "modules" => {
+                if self.sandbox.host.modules.is_empty() {
+                    outputln!(out, "(no modules loaded)");
+                } else {
+                    for (name, base) in self.sandbox.host.modules.iter() {
+                        outputln!(out, "0x{:08x} {}", base, name);
+                    }
+                }
+            }
+            other => {
+                outputln!(
+                    out,
+                    "unknown monitor command: {}; try 'monitor help'",
+                    other
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HostIo for SandboxTarget {
+    /// Round-10 P2 — wire `vFile:open`. The codec DLL is the
+    /// only file we serve, matched by basename so an operator
+    /// running `(gdb) add-symbol-file remote:IR32_32.DLL`
+    /// resolves regardless of the codec's local path on the
+    /// debugger host.
+    fn support_open(&mut self) -> Option<HostIoOpenOps<'_, Self>> {
+        Some(self)
+    }
+
+    /// Round-10 P2 — wire `vFile:pread`. Reads slice into the
+    /// retained DLL bytes; returns `EBADF` on stale fd.
+    fn support_pread(&mut self) -> Option<HostIoPreadOps<'_, Self>> {
+        Some(self)
+    }
+
+    /// Round-10 P2 — wire `vFile:close`. Frees the slot in our
+    /// `open_files` table; never fails for a known fd, returns
+    /// `EBADF` for unknown ones.
+    fn support_close(&mut self) -> Option<HostIoCloseOps<'_, Self>> {
+        Some(self)
+    }
+}
+
+impl HostIoOpen for SandboxTarget {
+    /// Round-10 P2 — open the requested filename if it matches
+    /// our retained codec DLL's basename (case-insensitive,
+    /// matching how Win32 `LoadLibraryA` treats DLL names).
+    /// Returns `ENOENT` for any other name. We ignore `flags`
+    /// because we only ever serve a read-only in-memory view —
+    /// `O_WRONLY` / `O_RDWR` requests are also accepted (we
+    /// just won't honour writes via `support_pwrite` — which we
+    /// don't advertise — so the client will get a "not
+    /// supported" wire-level reply if it tries to write).
+    /// `mode` is similarly ignored: nothing here creates a
+    /// new file.
+    fn open(
+        &mut self,
+        filename: &[u8],
+        _flags: HostIoOpenFlags,
+        _mode: HostIoOpenMode,
+    ) -> HostIoResult<u32, Self> {
+        // Lossy UTF-8: filenames in the GDB host_io packet are
+        // always ASCII in practice (a `vFile:open
+        // remote:<NAME>` decoded by `add-symbol-file`).
+        let name = String::from_utf8_lossy(filename);
+        // Strip a single leading slash so the GDB form
+        // `vFile:open /IR32_32.DLL` (which gdb-on-host
+        // sometimes sends) and the bare-basename form both
+        // resolve. Then take the basename (everything after
+        // the final `/` or `\`).
+        let trimmed = name.trim_start_matches('/');
+        let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+        if !basename.eq_ignore_ascii_case(&self.exec_file_name) {
+            return Err(HostIoError::Errno(HostIoErrno::ENOENT));
+        }
+        // Allocate a fresh fd. fd=0 is reserved per POSIX
+        // convention; our wire fd is `slot_index + 1`.
+        self.open_files.push(Some(()));
+        let fd = self.open_files.len() as u32;
+        Ok(fd)
+    }
+}
+
+impl HostIoPread for SandboxTarget {
+    /// Round-10 P2 — paginated read into the retained DLL
+    /// bytes. `offset` past EOF returns 0 (EOF marker per
+    /// the GDB host_io contract); short trailing reads are
+    /// the natural document terminator.
+    fn pread(
+        &mut self,
+        fd: u32,
+        count: usize,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> HostIoResult<usize, Self> {
+        // Validate fd: 1..=open_files.len() and slot must be Some.
+        if fd == 0 {
+            return Err(HostIoError::Errno(HostIoErrno::EBADF));
+        }
+        let idx = fd as usize - 1;
+        match self.open_files.get(idx) {
+            Some(Some(())) => {}
+            _ => return Err(HostIoError::Errno(HostIoErrno::EBADF)),
+        }
+        let total = self.dll_bytes.len() as u64;
+        if offset >= total {
+            return Ok(0);
+        }
+        let start = offset as usize;
+        let remaining = self.dll_bytes.len() - start;
+        let n = remaining.min(count).min(buf.len());
+        buf[..n].copy_from_slice(&self.dll_bytes[start..start + n]);
+        Ok(n)
+    }
+}
+
+impl HostIoClose for SandboxTarget {
+    /// Round-10 P2 — release the fd slot. Stale `vFile:close`
+    /// after a previous close returns `EBADF` rather than
+    /// silently succeeding.
+    fn close(&mut self, fd: u32) -> HostIoResult<(), Self> {
+        if fd == 0 {
+            return Err(HostIoError::Errno(HostIoErrno::EBADF));
+        }
+        let idx = fd as usize - 1;
+        match self.open_files.get_mut(idx) {
+            Some(slot @ Some(())) => {
+                *slot = None;
+                Ok(())
+            }
+            _ => Err(HostIoError::Errno(HostIoErrno::EBADF)),
+        }
+    }
+}
+
+impl SandboxTarget {
+    /// Count of currently-open `vFile` fds. Used by `monitor
+    /// stats`. We don't store this as a counter because
+    /// `Vec<Option<()>>` is the source of truth and divergence
+    /// would be a worse bug than the O(n) walk on every
+    /// `monitor stats` invocation (where n is bounded by a
+    /// real GDB session's lifetime symbol-loads — typically
+    /// 1 or 2).
+    fn live_open_fds(&self) -> usize {
+        self.open_files.iter().filter(|s| s.is_some()).count()
+    }
+}
+
 impl ExecFile for SandboxTarget {
     /// Round-7 P2 — return the codec's filename (the basename
     /// the operator passed via the CLI `dll_or_ax_file`
@@ -1635,6 +1957,43 @@ mod tests {
             Err(TargetError::Errno(n)) => panic!("errno target error: {n}"),
             Err(TargetError::Io(e)) => panic!("io target error: {e}"),
             Err(_) => panic!("unknown target error variant"),
+        }
+    }
+
+    /// Helper — `HostIoError<anyhow::Error>` mirrors the
+    /// TargetError shape but doesn't impl Debug, so the same
+    /// promote-or-panic helper is needed for the host_io tests.
+    /// Returns the success value or formats the errno on the
+    /// way to the panic.
+    fn ok_io<T>(r: HostIoResult<T, SandboxTarget>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(HostIoError::Errno(n)) => panic!("host_io errno: {n:?}"),
+            Err(HostIoError::Fatal(e)) => panic!("host_io fatal: {e}"),
+        }
+    }
+
+    /// Helper — assert a host_io call returned `EBADF`. We
+    /// can't take a `HostIoErrno` parameter because that enum
+    /// doesn't impl `PartialEq` in gdbstub 0.7.10, so each
+    /// expected errno gets its own asserter. The two we
+    /// exercise (ENOENT, EBADF) cover the round-10 surface.
+    fn assert_io_ebadf<T>(r: HostIoResult<T, SandboxTarget>, what: &str) {
+        match r {
+            Err(HostIoError::Errno(HostIoErrno::EBADF)) => {}
+            Err(HostIoError::Errno(_)) => panic!("{what}: expected EBADF, got other errno"),
+            Err(HostIoError::Fatal(e)) => panic!("{what}: expected EBADF, got fatal: {e}"),
+            Ok(_) => panic!("{what}: expected EBADF, got Ok(_)"),
+        }
+    }
+
+    /// Helper — assert a host_io call returned `ENOENT`.
+    fn assert_io_enoent<T>(r: HostIoResult<T, SandboxTarget>, what: &str) {
+        match r {
+            Err(HostIoError::Errno(HostIoErrno::ENOENT)) => {}
+            Err(HostIoError::Errno(_)) => panic!("{what}: expected ENOENT, got other errno"),
+            Err(HostIoError::Fatal(e)) => panic!("{what}: expected ENOENT, got fatal: {e}"),
+            Ok(_) => panic!("{what}: expected ENOENT, got Ok(_)"),
         }
     }
 
@@ -1925,7 +2284,7 @@ mod tests {
 
         let forward: ForwardSink =
             Arc::new(Mutex::new(Some(Box::new(SharedWriter(captured.clone())))));
-        let mut t = SandboxTarget::with_forward(sb, forward, &[], None, String::new());
+        let mut t = SandboxTarget::with_forward(sb, forward, &[], None, String::new(), Vec::new());
 
         let r = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
         assert_eq!(r, oxideav_vfw::emulator::isa_int::StepOk::Continued);
@@ -2123,6 +2482,7 @@ mod tests {
             &[0x10001234, 0x20002020],
             None,
             String::new(),
+            Vec::new(),
         );
         // Both PCs were pre-registered as `sw_bps` so a connected
         // GDB client would halt at them.
@@ -2166,6 +2526,7 @@ mod tests {
             &[0x10001234],
             None,
             String::new(),
+            Vec::new(),
         );
         // Should not panic and should leave the forward None.
         t.emit_breakpoint_event(0x10001234);
@@ -2219,7 +2580,8 @@ mod tests {
         sb.cpu.regs.gp[Reg32::Edi as usize] = DATA_BASE + 0x100;
         // Register `--break` for the post-`mov` EIP.
         const BP_PC: u32 = CODE_BASE + 2;
-        let mut t = SandboxTarget::with_forward(sb, forward, &[BP_PC], None, String::new());
+        let mut t =
+            SandboxTarget::with_forward(sb, forward, &[BP_PC], None, String::new(), Vec::new());
         // One step — EIP advances to BP_PC. Driver in the real
         // event loop would notice and emit; emulate that here.
         let _ = t.sandbox.cpu.step(&mut t.sandbox.mmu).unwrap();
@@ -2411,6 +2773,7 @@ mod tests {
             &[],
             Some(img),
             "synth.dll".to_string(),
+            Vec::new(),
         );
         assert!(Target::support_memory_map(&mut t_some).is_some());
     }
@@ -2427,6 +2790,7 @@ mod tests {
             &[],
             Some(img),
             "synth.dll".to_string(),
+            Vec::new(),
         );
         let mut assembled: Vec<u8> = Vec::new();
         let mut buf = [0u8; 32];
@@ -2468,6 +2832,7 @@ mod tests {
             &[],
             None,
             "IR32_32.DLL".to_string(),
+            Vec::new(),
         );
         assert!(Target::support_exec_file(&mut t_some).is_some());
     }
@@ -2484,6 +2849,7 @@ mod tests {
             &[],
             None,
             "INDEO5.AX".to_string(),
+            Vec::new(),
         );
         // Single-shot read covers the whole name.
         let mut buf = [0u8; 64];
@@ -2680,6 +3046,7 @@ mod tests {
             &[],
             None,
             "synth.dll".to_string(),
+            Vec::new(),
         );
         assert!(Target::support_libraries(&mut t).is_some());
     }
@@ -2696,6 +3063,7 @@ mod tests {
             &[],
             None,
             "synth.dll".to_string(),
+            Vec::new(),
         );
 
         let mut assembled: Vec<u8> = Vec::new();
@@ -2735,6 +3103,7 @@ mod tests {
             &[],
             None,
             "synth.dll".to_string(),
+            Vec::new(),
         );
         let xml = &t.library_list_xml;
         assert!(
@@ -2830,6 +3199,7 @@ mod tests {
             &[],
             Some(img),
             "synth.dll".to_string(),
+            Vec::new(),
         );
         assert!(Target::support_auxv(&mut t_some).is_some());
     }
@@ -2847,6 +3217,7 @@ mod tests {
             &[],
             Some(img),
             "synth.dll".to_string(),
+            Vec::new(),
         );
 
         let mut assembled: Vec<u8> = Vec::new();
@@ -2901,5 +3272,258 @@ mod tests {
         assert_eq!(phnum, 0);
         // AT_NULL terminator at the tail.
         assert_eq!(&blob[56..64], &[0u8; 8]);
+    }
+
+    /// Round-10 P2 — the host_io extension is gated on the
+    /// retained DLL bytes. Empty bytes → no extension; non-
+    /// empty → extension wired. Same gating contract as the
+    /// other "advertise only when we have data" predicates
+    /// (memory_map / exec_file / libraries / auxv).
+    #[test]
+    fn support_host_io_gated_on_dll_bytes_presence() {
+        let mut t_none = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_host_io(&mut t_none).is_none());
+
+        let mut t_some = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "IR32_32.DLL".to_string(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        );
+        assert!(Target::support_host_io(&mut t_some).is_some());
+    }
+
+    /// Round-10 P2 — `support_monitor_cmd` is unconditionally
+    /// available (commands work regardless of whether a DLL is
+    /// loaded — `monitor stats` is useful in either case).
+    #[test]
+    fn support_monitor_cmd_always_available() {
+        let mut t = SandboxTarget::new(Sandbox::new());
+        assert!(Target::support_monitor_cmd(&mut t).is_some());
+    }
+
+    /// Round-10 P2 — `vFile:open` matches the codec basename
+    /// case-insensitively (Win32 `LoadLibraryA` lookup is
+    /// case-insensitive too) and returns a non-zero fd. Other
+    /// names resolve to `ENOENT` so a stray `add-symbol-file`
+    /// against the wrong name fails cleanly.
+    #[test]
+    fn host_io_open_matches_basename_case_insensitive() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "IR32_32.DLL".to_string(),
+            vec![0u8; 256],
+        );
+        // Exact-case match.
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"IR32_32.DLL",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        assert_ne!(fd, 0);
+        // Case-insensitive match.
+        let fd2 = ok_io(HostIoOpen::open(
+            &mut t,
+            b"ir32_32.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        assert_ne!(fd2, 0);
+        assert_ne!(fd, fd2, "each open should allocate a distinct fd");
+
+        // Mismatched name → ENOENT.
+        assert_io_enoent(
+            HostIoOpen::open(
+                &mut t,
+                b"NOT_THE_DLL.DLL",
+                HostIoOpenFlags::O_RDONLY,
+                HostIoOpenMode::empty(),
+            ),
+            "open NOT_THE_DLL.DLL",
+        );
+    }
+
+    /// Round-10 P2 — `vFile:open` accepts both bare-basename
+    /// and slash-prefixed forms (`/IR32_32.DLL`,
+    /// `path/IR32_32.DLL`, `path\IR32_32.DLL`). The basename
+    /// extractor strips everything before the final `/` or
+    /// `\`. This matters because GDB clients sometimes send
+    /// path-style names through `add-symbol-file remote:…`.
+    #[test]
+    fn host_io_open_strips_path_prefixes() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "INDEO5.AX".to_string(),
+            vec![0u8; 32],
+        );
+        for name in [
+            &b"INDEO5.AX"[..],
+            &b"/INDEO5.AX"[..],
+            &b"/some/path/INDEO5.AX"[..],
+            &b"C:\\Windows\\System32\\INDEO5.AX"[..],
+        ] {
+            let fd = ok_io(HostIoOpen::open(
+                &mut t,
+                name,
+                HostIoOpenFlags::O_RDONLY,
+                HostIoOpenMode::empty(),
+            ));
+            assert_ne!(fd, 0, "open {name:?} returned fd=0");
+        }
+    }
+
+    /// Round-10 P2 — `vFile:pread` returns the requested slice
+    /// of the DLL bytes. Past-EOF returns 0 (terminator).
+    /// Reads short trailing chunks. Verifies the byte-for-byte
+    /// fidelity an `add-symbol-file remote:…` client needs to
+    /// resolve symbols against the in-memory image.
+    #[test]
+    fn host_io_pread_returns_dll_bytes_paginated() {
+        // Build a 1024-byte payload with a recognisable shape.
+        let dll: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+            dll.clone(),
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"synth.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        // Single-shot full read.
+        let mut buf = vec![0u8; dll.len()];
+        let n = ok_io(HostIoPread::pread(&mut t, fd, dll.len(), 0, &mut buf));
+        assert_eq!(n, dll.len());
+        assert_eq!(buf, dll);
+
+        // Past-EOF returns 0.
+        let mut tail = [0u8; 16];
+        let n = ok_io(HostIoPread::pread(
+            &mut t,
+            fd,
+            tail.len(),
+            dll.len() as u64,
+            &mut tail,
+        ));
+        assert_eq!(n, 0);
+
+        // Paginated reassembly with odd chunk size.
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 17];
+        let mut offset: u64 = 0;
+        loop {
+            let n = ok_io(HostIoPread::pread(
+                &mut t,
+                fd,
+                chunk.len(),
+                offset,
+                &mut chunk,
+            ));
+            if n == 0 {
+                break;
+            }
+            assembled.extend_from_slice(&chunk[..n]);
+            offset += n as u64;
+        }
+        assert_eq!(assembled, dll, "paginated reads should reassemble dll");
+    }
+
+    /// Round-10 P2 — `vFile:pread` against a stale fd (after
+    /// `vFile:close`) returns `EBADF` instead of silently
+    /// aliasing onto a future `open`. Matches POSIX semantics.
+    #[test]
+    fn host_io_pread_after_close_returns_ebadf() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+            vec![0xAB; 64],
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"synth.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        ok_io(HostIoClose::close(&mut t, fd));
+
+        let mut buf = [0u8; 4];
+        assert_io_ebadf(
+            HostIoPread::pread(&mut t, fd, 4, 0, &mut buf),
+            "pread after close",
+        );
+        // Closing twice is also EBADF.
+        assert_io_ebadf(HostIoClose::close(&mut t, fd), "double close");
+    }
+
+    /// Round-10 P2 — `vFile:pread` / `vFile:close` with fd=0
+    /// (POSIX stdin reservation) returns `EBADF`. We never
+    /// allocate fd=0 ourselves; this guards against a buggy
+    /// or hostile client passing the reserved value.
+    #[test]
+    fn host_io_fd_zero_is_always_ebadf() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+            vec![0u8; 8],
+        );
+        let mut buf = [0u8; 4];
+        assert_io_ebadf(HostIoPread::pread(&mut t, 0, 4, 0, &mut buf), "pread fd=0");
+        assert_io_ebadf(HostIoClose::close(&mut t, 0), "close fd=0");
+    }
+
+    /// Round-10 P1 — `live_open_fds` reflects the current
+    /// open-file count (used by `monitor stats`). Starts at 0,
+    /// rises with each `open`, drops on `close`. Verifies the
+    /// counter is consistent with the actual `open_files`
+    /// table (the source of truth).
+    #[test]
+    fn live_open_fds_tracks_open_close_balance() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+            vec![0u8; 8],
+        );
+        assert_eq!(t.live_open_fds(), 0);
+        let fd_a = ok_io(HostIoOpen::open(
+            &mut t,
+            b"synth.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        assert_eq!(t.live_open_fds(), 1);
+        let fd_b = ok_io(HostIoOpen::open(
+            &mut t,
+            b"synth.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        assert_eq!(t.live_open_fds(), 2);
+        ok_io(HostIoClose::close(&mut t, fd_a));
+        assert_eq!(t.live_open_fds(), 1);
+        ok_io(HostIoClose::close(&mut t, fd_b));
+        assert_eq!(t.live_open_fds(), 0);
     }
 }

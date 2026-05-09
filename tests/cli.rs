@@ -1793,6 +1793,518 @@ fn qxfer_auxv_read_returns_synthetic_aux_vector() {
     let _ = child.wait();
 }
 
+/// Round-10 P1 — `qRcmd` (the `monitor` command) surfaces
+/// sandbox state introspection from the GDB prompt. We exercise
+/// `monitor stats`, `monitor watches`, `monitor breakpoints`,
+/// `monitor modules`, and `monitor help` — verifying the wire-
+/// level qRcmd hex-encoded request + the hex-encoded `O…`
+/// progress packets gdbstub uses to deliver console output, plus
+/// the trailing `OK` (or `Enn`) response.
+///
+/// The qRcmd packet is `qRcmd,<HEX>` where HEX is the lowercase
+/// hex-encoding of the bytes the operator typed after `monitor `.
+/// Output comes back as one or more `O<HEX>` packets (each carrying
+/// hex-encoded ASCII), followed by an `OK` terminator. We
+/// reassemble the hex chunks into a String and assert each command
+/// surfaces the expected operator-facing labels.
+#[test]
+fn qrcmd_monitor_commands_return_sandbox_state() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(dll.path())
+        .arg("--break")
+        .arg("0x10001234")
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet(sock: &mut TcpStream) -> String {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload: Vec<u8> = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            // RSP run-length: `*N` repeats the previous byte
+            // (N - 29) times. The `O…` console-output packets
+            // gdbstub emits use this when there's a long run of
+            // identical hex chars.
+            if buf[0] == b'*' {
+                let mut nb = [0u8; 1];
+                sock.read_exact(&mut nb).expect("read RLE count");
+                let n = (nb[0] as i32 - 29).max(0) as usize;
+                if let Some(&last) = payload.last() {
+                    for _ in 0..n {
+                        payload.push(last);
+                    }
+                }
+                continue;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        String::from_utf8_lossy(&payload).into_owned()
+    }
+
+    /// Build a `qRcmd,<HEX>` packet from a human-readable
+    /// monitor command body (`stats`, `help`, etc.).
+    fn rcmd(cmd: &str) -> Vec<u8> {
+        let hex: String = cmd.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        rsp_packet(&format!("qRcmd,{hex}"))
+    }
+
+    /// Drain `O<HEX>` console-output packets from the stub
+    /// until we see the terminator (`OK` or `Enn` or empty);
+    /// reassemble the hex into a String. Returns the assembled
+    /// output and the terminator string. `OK` itself starts
+    /// with `O` but is the terminator (not a hex-output
+    /// packet); `OK`-shaped console output would be `O4f4b` so
+    /// we special-case the bare-`OK` form.
+    fn drain_monitor_output(sock: &mut TcpStream) -> (String, String) {
+        let mut out = String::new();
+        loop {
+            let resp = read_packet(sock);
+            // `OK` (literal two chars) is the terminator — not
+            // a console-output packet (which would be `O4f4b`).
+            if resp == "OK" {
+                return (out, resp);
+            }
+            if let Some(rest) = resp.strip_prefix('O') {
+                // Console output: lowercase-hex chunk, even
+                // length. Hex-decode by 2-char windows.
+                if rest.len() % 2 == 0 && rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let bytes = (0..rest.len())
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(&rest[i..i + 2], 16).ok())
+                        .collect::<Vec<u8>>();
+                    out.push_str(&String::from_utf8_lossy(&bytes));
+                    continue;
+                }
+                // Not pure hex — treat as terminator.
+                return (out, resp);
+            }
+            // Anything not starting with 'O' (E-error, empty,
+            // …) is the terminator.
+            return (out, resp);
+        }
+    }
+
+    // qSupported handshake — required so the stub negotiates
+    // packet sizes that fit the qRcmd reply.
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet(&mut sock);
+
+    // 1. monitor help — lists known commands.
+    sock.write_all(&rcmd("help")).expect("write monitor help");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(
+        term, "OK",
+        "expected OK terminator after help, got: {term:?}"
+    );
+    assert!(out.contains("stats"), "monitor help missing stats: {out:?}");
+    assert!(
+        out.contains("watches"),
+        "monitor help missing watches: {out:?}"
+    );
+    assert!(
+        out.contains("breakpoints"),
+        "monitor help missing breakpoints: {out:?}"
+    );
+    assert!(
+        out.contains("modules"),
+        "monitor help missing modules: {out:?}"
+    );
+
+    // 2. monitor stats — instr_count + counters lines.
+    sock.write_all(&rcmd("stats")).expect("write monitor stats");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    assert!(
+        out.contains("instr_count="),
+        "monitor stats missing instr_count: {out:?}"
+    );
+    assert!(
+        out.contains("loaded_modules="),
+        "monitor stats missing loaded_modules: {out:?}"
+    );
+    assert!(
+        out.contains("exec_file="),
+        "monitor stats missing exec_file: {out:?}"
+    );
+    assert!(
+        out.contains("cli_breakpoints=1"),
+        "monitor stats expected cli_breakpoints=1 (we passed --break), got: {out:?}"
+    );
+
+    // 3. monitor breakpoints — lists the CLI-registered PC.
+    sock.write_all(&rcmd("breakpoints"))
+        .expect("write monitor breakpoints");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    assert!(
+        out.contains("0x10001234"),
+        "monitor breakpoints missing CLI PC: {out:?}"
+    );
+    assert!(
+        out.contains("(cli)"),
+        "monitor breakpoints missing (cli) annotation: {out:?}"
+    );
+
+    // 4. monitor modules — lists loaded modules (synth.dll +
+    //    cascade-loaded kernel32 etc.). We just check that the
+    //    primary DLL surfaces (lowercase basename per the
+    //    loader's case-folding contract).
+    sock.write_all(&rcmd("modules"))
+        .expect("write monitor modules");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains(".dll") || lower.contains(".ax"),
+        "monitor modules missing any module entry: {out:?}"
+    );
+
+    // 5. monitor watches — empty (we registered none) yields
+    //    the placeholder line.
+    sock.write_all(&rcmd("watches"))
+        .expect("write monitor watches");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    assert!(
+        out.contains("no HW watchpoints"),
+        "monitor watches expected empty placeholder, got: {out:?}"
+    );
+
+    // 6. unknown command — informative reply, still OK.
+    sock.write_all(&rcmd("frobnicate"))
+        .expect("write monitor frobnicate");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    assert!(
+        out.contains("unknown monitor command"),
+        "expected unknown-command reply, got: {out:?}"
+    );
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
+/// Round-10 P2 — host_io `vFile:open` + `vFile:pread` +
+/// `vFile:close` round-trip the codec DLL bytes back to a
+/// connected GDB client. Operator-facing this enables
+/// `(gdb) add-symbol-file remote:<basename>` for symbol
+/// resolution against the in-memory image without manual
+/// file transfer.
+///
+/// The wire contract per the GDB RSP manual §"Host I/O Packets":
+/// - `vFile:open:FILENAME,FLAGS,MODE` — FILENAME is hex-encoded;
+///   reply `Ffd[,errno]` (lowercase hex); `fd >= 0` on success.
+/// - `vFile:pread:FD,COUNT,OFFSET` — all three fields lowercase
+///   hex; reply `Fbytes_read[;DATA]` where DATA is the binary
+///   payload (with `}xx` escaping for `$`/`#`/`}`/`*`).
+/// - `vFile:close:FD` — reply `F0` on success.
+#[test]
+fn vfile_open_pread_close_round_trips_dll_bytes() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let dll_path = dll.path().to_path_buf();
+    let dll_bytes = std::fs::read(&dll_path).expect("read synth dll");
+    let basename = dll_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("basename")
+        .to_string();
+
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(&dll_path)
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    /// Read a packet, returning the raw payload bytes. The
+    /// vFile:pread reply is binary — we MUST NOT lose bytes to
+    /// UTF-8 lossy conversion. Handles two layers of decoding
+    /// per the GDB RSP framing:
+    ///   - `}xx` binary escape (xx XOR 0x20 = original byte).
+    ///   - `*N` run-length encoding (N - 29 = repeat count of
+    ///     the previously-emitted byte).
+    fn read_packet_raw(sock: &mut TcpStream) -> Vec<u8> {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            // GDB binary escape: `}` followed by (orig XOR 0x20).
+            if buf[0] == b'}' {
+                let mut esc = [0u8; 1];
+                sock.read_exact(&mut esc).expect("read escape byte");
+                payload.push(esc[0] ^ 0x20);
+                continue;
+            }
+            // RSP run-length: `*N` repeats the previous byte
+            // (N - 29) times. Per GDB protocol manual.
+            if buf[0] == b'*' {
+                let mut nb = [0u8; 1];
+                sock.read_exact(&mut nb).expect("read RLE count");
+                let n = (nb[0] as i32 - 29).max(0) as usize;
+                if let Some(&last) = payload.last() {
+                    for _ in 0..n {
+                        payload.push(last);
+                    }
+                }
+                continue;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        payload
+    }
+
+    // qSupported handshake — required so the stub negotiates the
+    // correct packet sizes for vFile replies.
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet_raw(&mut sock);
+
+    // 1. vFile:open — hex-encode the basename, flags=0
+    //    (O_RDONLY), mode=0.
+    let name_hex: String = basename
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let open_pkt = format!("vFile:open:{name_hex},0,0");
+    sock.write_all(&rsp_packet(&open_pkt))
+        .expect("write vFile:open");
+    let resp = String::from_utf8_lossy(&read_packet_raw(&mut sock)).into_owned();
+    assert!(
+        resp.starts_with('F'),
+        "expected 'F<fd>' reply to vFile:open, got: {resp:?}"
+    );
+    // The reply format is `Ffd[,errno]`; success has no errno.
+    let body = &resp[1..];
+    let fd_str = body.split(',').next().unwrap_or("");
+    let fd = i64::from_str_radix(fd_str, 16).unwrap_or_else(|_| panic!("parse fd from: {resp:?}"));
+    assert!(fd >= 1, "expected fd >= 1 (fd=0 is reserved), got: {fd}");
+
+    // 2. vFile:pread — full read in one shot. Reply is
+    //    `F<count>;<binary-data>`.
+    let count = dll_bytes.len();
+    let pread_pkt = format!("vFile:pread:{fd:x},{count:x},0");
+    sock.write_all(&rsp_packet(&pread_pkt))
+        .expect("write vFile:pread");
+    let raw = read_packet_raw(&mut sock);
+    // Find the `;` that separates `F<count>` from the data.
+    let semi = raw
+        .iter()
+        .position(|&b| b == b';')
+        .unwrap_or_else(|| panic!("no ';' in pread reply: {:?}", String::from_utf8_lossy(&raw)));
+    let header = &raw[..semi];
+    let data = &raw[semi + 1..];
+    assert_eq!(
+        header[0],
+        b'F',
+        "expected 'F<count>' header, got: {:?}",
+        String::from_utf8_lossy(header)
+    );
+    let count_hex = std::str::from_utf8(&header[1..]).expect("count utf8");
+    let n = usize::from_str_radix(count_hex, 16).expect("parse count");
+    assert_eq!(
+        n,
+        dll_bytes.len(),
+        "expected pread to return all {} bytes, got {n}",
+        dll_bytes.len()
+    );
+    assert_eq!(
+        data,
+        &dll_bytes[..],
+        "vFile:pread payload should equal the codec DLL bytes"
+    );
+
+    // 3. vFile:pread past EOF — count = 0; EOF marker. The
+    //    exact wire shape varies by gdbstub version (`F0`,
+    //    `F0;`, `F00`, `F00;…`); accept any reply whose
+    //    decoded `<count>` is 0.
+    let past = dll_bytes.len();
+    let eof_pkt = format!("vFile:pread:{fd:x},20,{past:x}");
+    sock.write_all(&rsp_packet(&eof_pkt))
+        .expect("write vFile:pread eof");
+    let raw = read_packet_raw(&mut sock);
+    let resp = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        resp.starts_with('F'),
+        "expected 'F<count>' EOF reply, got: {resp:?}"
+    );
+    let body = &resp[1..];
+    let count_hex = body.split(';').next().unwrap_or("");
+    let n = i64::from_str_radix(count_hex, 16).unwrap_or_else(|_| panic!("parse count: {resp:?}"));
+    assert_eq!(n, 0, "expected EOF (count=0), got {n} in {resp:?}");
+
+    // 4. vFile:close — F0 on success.
+    let close_pkt = format!("vFile:close:{fd:x}");
+    sock.write_all(&rsp_packet(&close_pkt))
+        .expect("write vFile:close");
+    let resp = String::from_utf8_lossy(&read_packet_raw(&mut sock)).into_owned();
+    assert_eq!(resp, "F0", "expected 'F0' on close, got: {resp:?}");
+
+    // 5. vFile:open against an unknown name — `F-1,2` (errno
+    //    ENOENT = 2).
+    let bad_hex: String = "no_such.dll"
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let bad_pkt = format!("vFile:open:{bad_hex},0,0");
+    sock.write_all(&rsp_packet(&bad_pkt))
+        .expect("write vFile:open bad");
+    let resp = String::from_utf8_lossy(&read_packet_raw(&mut sock)).into_owned();
+    // gdbstub formats the errno as `F-1,<hex>` where the hex
+    // is at least 1 char wide (often zero-padded — `,02`).
+    // ENOENT = 2 per POSIX (and gdbstub's `HostIoErrno::ENOENT`).
+    assert!(
+        resp.starts_with("F-1,"),
+        "expected 'F-1,<errno>' for unknown name, got: {resp:?}"
+    );
+    let errno_str = resp.trim_start_matches("F-1,");
+    let errno =
+        i64::from_str_radix(errno_str, 16).unwrap_or_else(|_| panic!("parse errno: {resp:?}"));
+    assert_eq!(errno, 2, "expected ENOENT (2), got {errno} in {resp:?}");
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet_raw(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
 /// Round-9 P2 — `qfThreadInfo` / `qsThreadInfo` advertise the
 /// single fixed thread the SingleThreadBase target presents.
 /// gdbstub auto-serves these queries on the strength of our

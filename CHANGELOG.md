@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 10 — `qRcmd` (GDB `monitor`) extension (P1).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::monitor_cmd::MonitorCmd`, surfaced via
+  `support_monitor_cmd`. Five operator-facing commands lift
+  sandbox state into the GDB prompt without leaving the
+  debugger:
+  `monitor stats` (instr_count + sw / cli / hw counters +
+  loaded-modules count + open vFile fds + exec_file),
+  `monitor watches` (one line per registered HW watchpoint —
+  `addr len kind`),
+  `monitor breakpoints` (one line per SW breakpoint, with
+  `(cli)` annotation for the `--break PC` set),
+  `monitor modules` (one line per `HostState::modules` entry —
+  `0x<base> <name>`, mirroring `qXfer:libraries:read` in
+  human-readable form),
+  `monitor help` (lists the known commands).
+  Unknown commands return `unknown monitor command: <cmd>;
+  try 'monitor help'`. The extension is unconditionally
+  available — these queries don't require a loaded image, so
+  even a `--gdb` session with a non-PE blob can introspect the
+  CPU's idle state. One TCP-level integration test
+  (`qrcmd_monitor_commands_return_sandbox_state`) drives the
+  binary end-to-end and asserts every command's output shape +
+  the unknown-command path.
+- **Round 10 — `vFile:open`/`pread`/`close` host_io extension (P2).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::host_io::{HostIo, HostIoOpen,
+  HostIoPread, HostIoClose}`, gated on the retained codec DLL
+  bytes (the `with_forward` constructor now carries
+  `dll_bytes: Vec<u8>`). A connected GDB client running
+  `(gdb) add-symbol-file remote:<basename>` triggers a
+  `vFile:open` for the codec basename; we match
+  case-insensitively (mirroring Win32 `LoadLibraryA`'s lookup
+  contract), strip leading `/` and any `/` or `\` prefix
+  components, and hand back a fresh `u32` fd. `vFile:pread`
+  paginates through the in-memory bytes; `vFile:close` releases
+  the fd slot. Stale-fd reads (after `close`) and reads against
+  fd=0 (POSIX stdin) return `HostIoErrno::EBADF`; mismatched
+  filenames return `HostIoErrno::ENOENT`. Eight unit tests
+  cover the gating predicate, basename matching (exact + case-
+  insensitive), path-prefix stripping (`/`, `/some/path/`,
+  `C:\...\`), full-byte read fidelity + paginated reassembly,
+  past-EOF terminator, post-close `EBADF`, fd=0 `EBADF`, and
+  the `live_open_fds` counter (used by `monitor stats`). One
+  TCP-level integration test
+  (`vfile_open_pread_close_round_trips_dll_bytes`) drives the
+  full RSP wire path — `vFile:open:HEX,0,0` →
+  `vFile:pread:fd,count,0` → byte-equal payload assertion → EOF
+  marker → `vFile:close` → unknown-name `F-1,2` (ENOENT) — with
+  a `read_packet_raw` helper that decodes both the GDB binary
+  escape (`}xx`) AND the RSP run-length encoding (`*N`) so the
+  reassembled binary blob matches the original DLL bit-for-bit.
+
 - **Round 9 — `qXfer:auxv:read` synthetic ELF auxiliary vector (P1).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::auxv::Auxv`, advertised via
