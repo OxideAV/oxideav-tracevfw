@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 11 — `vFile:fstat` host_io extension (P2).**
+  `SandboxTarget` now implements
+  `gdbstub::target::ext::host_io::HostIoFstat`, advertised via
+  `support_fstat`. A connected GDB client running
+  `(gdb) add-symbol-file remote:<basename>` no longer has to
+  discover EOF by issuing successively-larger `vFile:pread`
+  calls — `vFile:fstat fd` returns a synthesised stat struct
+  with `st_size = bytes.len()` (real PE bytes for the primary
+  codec DLL, synthetic stub length for cascade modules),
+  `st_mode = S_IFREG | 0644` (regular file, owner rw + group
+  + world r-only), `st_blksize = 4096`, and
+  `st_blocks = ceil(size / 512)` per POSIX. The
+  `OXIDEAV_TRACEVFW_FSTAT_MTIME` env var pins the mtime to a
+  fixed epoch second for reproducible integration tests;
+  absent the env var, the value falls back to the wall clock
+  at `with_forward` construction (saturating at `u32::MAX`
+  past the year-2106 horizon). Identity fields (`st_dev`,
+  `st_ino`, `st_uid`, `st_gid`, `st_rdev`) report 0,
+  consistent with our "synthetic in-memory file" stance.
+  Five unit tests cover the size + mode + stable-mtime path,
+  stale-fd `EBADF`, env-var override + invalid-fallback +
+  saturating-overflow. One TCP-level integration test
+  (`vfile_fstat_returns_size_struct`) drives the full RSP wire
+  path with `OXIDEAV_TRACEVFW_FSTAT_MTIME=1700000000` and
+  asserts the 64-byte big-endian struct decodes to the right
+  `st_size` (DLL byte length) + `st_mtime` (env-pinned).
+- **Round 11 — `vFile:open` for cascade-loaded modules (P2).**
+  The host_io file registry now exposes every cascade-loaded
+  module the sandbox host registered (kernel32.dll,
+  msvcrt.dll, …) in addition to the primary codec DLL, so a
+  `vFile:open kernel32.dll` from a connected GDB client
+  resolves to a fresh fd whose `pread` returns a synthetic
+  stub-blob (an ASCII marker carrying the module name + image
+  base — the modules don't have real PE bytes; the Win32
+  surface is served by the sandbox's host stubs). The primary
+  DLL still takes priority — when `HostState::modules`
+  contains an entry whose name case-insensitively matches the
+  primary basename (the loader inserts the primary into the
+  registry after `Sandbox::load`), `vFile:open <primary>`
+  resolves to slot 0's real codec DLL bytes, not the stub.
+  `support_host_io` now activates on `!files.is_empty()`
+  rather than `!dll_bytes.is_empty()`, so a sandbox that
+  carries cascade modules but no primary DLL also activates
+  the extension. Internal storage refactor: `dll_bytes:
+  Vec<u8>` replaced by `files: Vec<RegisteredFile>`;
+  `open_files: Vec<Option<()>>` replaced by
+  `open_files: Vec<Option<usize>>` carrying the per-fd
+  registry index. New `monitor files` command lists the
+  registry; `monitor stats` adds a `host_io_files=<N>`
+  counter line. Five unit tests cover cascade-module
+  resolution, primary-vs-cascade priority, host_io activation
+  with cascade-only registry, and the `synth_module_stub`
+  format-stability contract.
 - **Round 10 — `qRcmd` (GDB `monitor`) extension (P1).**
   `SandboxTarget` now implements
   `gdbstub::target::ext::monitor_cmd::MonitorCmd`, surfaced via

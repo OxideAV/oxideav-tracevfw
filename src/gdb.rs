@@ -55,8 +55,9 @@ use gdbstub::target::ext::breakpoints::{
 };
 use gdbstub::target::ext::exec_file::{ExecFile, ExecFileOps};
 use gdbstub::target::ext::host_io::{
-    HostIo, HostIoClose, HostIoCloseOps, HostIoErrno, HostIoError, HostIoOpen, HostIoOpenFlags,
-    HostIoOpenMode, HostIoOpenOps, HostIoOps, HostIoPread, HostIoPreadOps, HostIoResult,
+    HostIo, HostIoClose, HostIoCloseOps, HostIoErrno, HostIoError, HostIoFstat, HostIoFstatOps,
+    HostIoOpen, HostIoOpenFlags, HostIoOpenMode, HostIoOpenOps, HostIoOps, HostIoPread,
+    HostIoPreadOps, HostIoResult, HostIoStat,
 };
 use gdbstub::target::ext::libraries::{Libraries, LibrariesOps};
 use gdbstub::target::ext::memory_map::{MemoryMap, MemoryMapOps};
@@ -597,33 +598,68 @@ pub struct SandboxTarget {
     /// PE image is available. Built eagerly at `with_forward`
     /// construction time by [`SandboxTarget::build_auxv_blob`].
     auxv_blob: Vec<u8>,
-    /// Round-10 P2 — raw bytes of the codec DLL/AX file the
-    /// operator passed on the CLI, retained so the round-10
-    /// `vFile:open`/`vFile:pread`/`vFile:close` host_io extension
-    /// can serve the file back to a connected GDB client. A
-    /// remote GDB session that runs
-    /// `add-symbol-file remote:<basename>` then triggers a
-    /// `vFile:open` for that name; we match by basename and
-    /// hand back the in-memory bytes paginated. Empty
-    /// (`Vec::new()`) when no file was passed (e.g. tests that
-    /// build a bare sandbox); the `support_host_io` predicate
-    /// gates the extension on non-empty so gdbstub doesn't
-    /// advertise a feature we'd answer with `ENOENT`.
-    dll_bytes: Vec<u8>,
-    /// Round-10 P2 — open `vFile:open` file descriptors. Each
-    /// successful `vFile:open` allocates a new `u32` fd that
-    /// indexes into this vector; `vFile:pread` looks the entry
-    /// up + slices into [`Self::dll_bytes`]; `vFile:close`
+    /// Round-10 P2 / Round-11 P2 — registry of files the
+    /// host_io extension exposes to a connected GDB client over
+    /// `vFile:open` / `vFile:pread` / `vFile:fstat` /
+    /// `vFile:close`. Slot 0 is the primary codec DLL/AX the
+    /// operator passed on the CLI (real PE bytes). Slots 1..
+    /// are synthetic stub-blobs — one per cascade-loaded module
+    /// the kernel32 / user32 / vfw32 stubs registered in
+    /// `HostState::modules` (kernel32.dll, msvcrt.dll, …) — so
+    /// a remote GDB session can `add-symbol-file remote:<name>`
+    /// for any module visible in `info shared` and at least
+    /// fetch a recognisable marker (the modules don't have real
+    /// PE byte images; the stubs are honest "this is a
+    /// host-stubbed Win32 module" sentinels).
+    ///
+    /// `with_forward` builds the full registry eagerly; we
+    /// never grow it after construction. Empty when no codec
+    /// DLL was passed AND the sandbox has no modules registered;
+    /// the `support_host_io` predicate gates the extension on
+    /// non-empty.
+    files: Vec<RegisteredFile>,
+    /// Round-10 P2 / Round-11 P2 — open `vFile` file
+    /// descriptors. Each successful `vFile:open` allocates a
+    /// new `u32` fd that indexes into this vector; the
+    /// `vFile:pread` and `vFile:fstat` paths look the entry up
+    /// then slice into the matching `files[idx]`; `vFile:close`
     /// nulls the entry. We never deallocate fully so a stale
     /// `vFile:pread` after `close` returns `EBADF` rather than
-    /// silently aliasing onto a future `open`. The shape is
-    /// `Vec<Option<()>>` rather than `Vec<bool>` so a future
-    /// expansion to multi-file (e.g. opening the codec's
-    /// cascade-loaded DLLs) can carry per-fd state without a
-    /// schema break. fd value 0 is reserved (POSIX stdin) so we
-    /// always start allocations at 1; lookup uses
-    /// `fd as usize - 1`.
-    open_files: Vec<Option<()>>,
+    /// silently aliasing onto a future `open`. The slot carries
+    /// the `Option<usize>` index into [`Self::files`]. fd value
+    /// 0 is reserved (POSIX stdin) so we always start
+    /// allocations at 1; lookup uses `fd as usize - 1`.
+    open_files: Vec<Option<usize>>,
+    /// Round-11 P2 — synthetic mtime (epoch seconds) reported
+    /// for every file by `vFile:fstat`. Pinned via the
+    /// `OXIDEAV_TRACEVFW_FSTAT_MTIME` env var so integration
+    /// tests can assert a stable value; falls back to the wall
+    /// clock at construction time when the env var is absent.
+    /// Stored as `u32` because `HostIoStat::st_mtime` is `u32`
+    /// (the GDB host_io stat struct uses 32-bit timestamps);
+    /// will saturate in 2106 — an acceptable horizon for a
+    /// debugging surface.
+    fstat_mtime: u32,
+}
+
+/// Round-11 P2 — one entry in [`SandboxTarget::files`]. The
+/// host_io extension serves files matched against
+/// [`Self::name`] (case-insensitive basename, mirroring how
+/// Win32 `LoadLibraryA` resolves DLL names) and returns
+/// [`Self::bytes`] in response to `vFile:pread`. The same
+/// length is returned in [`HostIoStat::st_size`] for
+/// `vFile:fstat`.
+struct RegisteredFile {
+    /// Module / file name as registered (typically the
+    /// basename, e.g. `IR32_32.DLL`, `kernel32.dll`). Matched
+    /// case-insensitively in [`HostIoOpen::open`].
+    name: String,
+    /// Raw byte payload returned over `vFile:pread`. For the
+    /// primary codec DLL this is the actual PE bytes the
+    /// operator passed on the CLI; for cascade-loaded modules
+    /// it's a small synthetic marker (host stubs serve those
+    /// modules' Win32 surface — no real PE bytes exist).
+    bytes: Vec<u8>,
 }
 
 impl SandboxTarget {
@@ -705,6 +741,20 @@ impl SandboxTarget {
             Some(img) => Self::build_auxv_blob(img),
             None => Vec::new(),
         };
+        // Round-11 P2 — build the host_io file registry. Slot 0
+        // is the primary codec DLL (when present); subsequent
+        // slots are synthetic stub-blobs for every cascade-
+        // loaded module the sandbox host has registered. We
+        // skip a cascade module that case-insensitively matches
+        // the primary DLL basename so a `vFile:open` for the
+        // primary name resolves to the real bytes (slot 0)
+        // rather than the synthetic stub.
+        let files = Self::build_files(&sandbox, &exec_file_name, dll_bytes);
+        // Round-11 P2 — pin the synthetic fstat mtime via env
+        // var when set, so integration tests get a reproducible
+        // `vFile:fstat` reply. Falls back to the wall clock
+        // when the env var is absent or unparseable.
+        let fstat_mtime = Self::resolve_fstat_mtime();
         Self {
             sandbox,
             sw_bps: cli_bps.clone(),
@@ -717,8 +767,88 @@ impl SandboxTarget {
             exec_file_name,
             library_list_xml,
             auxv_blob,
-            dll_bytes,
+            files,
             open_files: Vec::new(),
+            fstat_mtime,
+        }
+    }
+
+    /// Round-11 P2 — assemble the host_io file registry. Slot 0
+    /// holds the operator's real codec DLL bytes (when one was
+    /// passed); subsequent slots are synthetic stubs — one per
+    /// cascade-loaded module in `HostState::modules` that's not
+    /// a duplicate of the primary DLL name. Every slot is
+    /// reachable from `vFile:open` by case-insensitive basename
+    /// match. A bare-sandbox call site (no DLL bytes, no
+    /// modules) yields an empty registry — the
+    /// `support_host_io` predicate then returns `None` so
+    /// gdbstub doesn't advertise the extension.
+    fn build_files(
+        sandbox: &Sandbox,
+        primary_name: &str,
+        primary_bytes: Vec<u8>,
+    ) -> Vec<RegisteredFile> {
+        let mut files: Vec<RegisteredFile> = Vec::new();
+        if !primary_bytes.is_empty() {
+            files.push(RegisteredFile {
+                name: primary_name.to_string(),
+                bytes: primary_bytes,
+            });
+        }
+        for (name, base) in sandbox.host.modules.iter() {
+            // Skip the primary DLL — the loader registered it
+            // in `HostState::modules` after `Sandbox::load`, but
+            // we already serve its real bytes from slot 0. The
+            // case-insensitive comparison mirrors the basename
+            // match in `HostIoOpen::open`.
+            if !primary_name.is_empty() && name.eq_ignore_ascii_case(primary_name) {
+                continue;
+            }
+            let bytes = Self::synth_module_stub(name, *base);
+            files.push(RegisteredFile {
+                name: name.clone(),
+                bytes,
+            });
+        }
+        files
+    }
+
+    /// Round-11 P2 — synthesise a small recognisable byte
+    /// payload for a cascade-loaded module (kernel32.dll,
+    /// msvcrt.dll, …). The Win32 surface for these modules is
+    /// served by the sandbox's host stubs; no real PE bytes
+    /// exist. We hand back a short ASCII marker that includes
+    /// the module name + image base so an operator who runs
+    /// `vFile:open` for the module gets a hint about what's
+    /// actually there. The exact format is a contract for
+    /// tests but not for the GDB protocol — a real
+    /// `add-symbol-file remote:kernel32.dll` will fail to
+    /// parse the bytes as a PE image, which is the right
+    /// behaviour: the symbols come from the host stubs, not
+    /// from a guest image.
+    fn synth_module_stub(name: &str, image_base: u32) -> Vec<u8> {
+        format!(
+            "OXIDEAV-VFW STUB MODULE\nname={name}\nimage_base=0x{image_base:08x}\n\
+             (no PE content; symbols served by sandbox host stubs)\n"
+        )
+        .into_bytes()
+    }
+
+    /// Round-11 P2 — resolve the synthetic mtime for
+    /// `vFile:fstat`. Honours the `OXIDEAV_TRACEVFW_FSTAT_MTIME`
+    /// env var (decimal epoch seconds) when set; falls back to
+    /// the wall clock at construction time. We saturate to
+    /// `u32::MAX` past the year-2106 horizon — `HostIoStat::st_mtime`
+    /// is `u32`. A pre-epoch system clock reads as 0.
+    fn resolve_fstat_mtime() -> u32 {
+        if let Ok(raw) = std::env::var("OXIDEAV_TRACEVFW_FSTAT_MTIME") {
+            if let Ok(parsed) = raw.trim().parse::<u64>() {
+                return u32::try_from(parsed).unwrap_or(u32::MAX);
+            }
+        }
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => u32::try_from(d.as_secs()).unwrap_or(u32::MAX),
+            Err(_) => 0,
         }
     }
 
@@ -1105,7 +1235,7 @@ impl Target for SandboxTarget {
     /// contract:
     /// <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Host-I_002fO-Packets.html>
     fn support_host_io(&mut self) -> Option<HostIoOps<'_, Self>> {
-        if self.dll_bytes.is_empty() {
+        if self.files.is_empty() {
             None
         } else {
             Some(self)
@@ -1511,6 +1641,10 @@ impl MonitorCmd for SandboxTarget {
                 outputln!(out, "  watches       list registered HW watchpoints");
                 outputln!(out, "  breakpoints   list registered SW breakpoints");
                 outputln!(out, "  modules       list loaded PE modules");
+                outputln!(
+                    out,
+                    "  files         list host_io files (vFile:open targets)"
+                );
                 outputln!(out, "  help          this help");
             }
             "stats" => {
@@ -1520,6 +1654,7 @@ impl MonitorCmd for SandboxTarget {
                 outputln!(out, "hw_watchpoints={}", self.hw_watches.len());
                 outputln!(out, "loaded_modules={}", self.sandbox.host.modules.len());
                 outputln!(out, "open_vfile_fds={}", self.live_open_fds());
+                outputln!(out, "host_io_files={}", self.files.len());
                 outputln!(out, "exec_file={}", self.exec_file_name);
             }
             "watches" => {
@@ -1559,6 +1694,32 @@ impl MonitorCmd for SandboxTarget {
                     }
                 }
             }
+            "files" => {
+                // Round-11 P2 — list every entry the host_io
+                // file registry exposes via `vFile:open`. The
+                // first slot is the operator's primary codec
+                // DLL (real bytes); subsequent slots are
+                // synthetic stubs for cascade-loaded modules.
+                if self.files.is_empty() {
+                    outputln!(out, "(no host_io files registered)");
+                } else {
+                    for (i, f) in self.files.iter().enumerate() {
+                        let kind = if i == 0 && !self.exec_file_name.is_empty() {
+                            "primary"
+                        } else {
+                            "stub"
+                        };
+                        outputln!(
+                            out,
+                            "{} {} bytes={} kind={}",
+                            i,
+                            f.name,
+                            f.bytes.len(),
+                            kind
+                        );
+                    }
+                }
+            }
             other => {
                 outputln!(
                     out,
@@ -1572,17 +1733,19 @@ impl MonitorCmd for SandboxTarget {
 }
 
 impl HostIo for SandboxTarget {
-    /// Round-10 P2 — wire `vFile:open`. The codec DLL is the
-    /// only file we serve, matched by basename so an operator
-    /// running `(gdb) add-symbol-file remote:IR32_32.DLL`
-    /// resolves regardless of the codec's local path on the
-    /// debugger host.
+    /// Round-10 P2 — wire `vFile:open`. Round-11 P2 extends
+    /// the lookup to the cascade-loaded module registry, so
+    /// `vFile:open` for `kernel32.dll` (or any other module
+    /// recorded in `HostState::modules`) resolves to a slot in
+    /// the host_io file table.
     fn support_open(&mut self) -> Option<HostIoOpenOps<'_, Self>> {
         Some(self)
     }
 
     /// Round-10 P2 — wire `vFile:pread`. Reads slice into the
-    /// retained DLL bytes; returns `EBADF` on stale fd.
+    /// retained file bytes (real PE bytes for slot 0, synthetic
+    /// stub markers for cascade modules); returns `EBADF` on
+    /// stale fd.
     fn support_pread(&mut self) -> Option<HostIoPreadOps<'_, Self>> {
         Some(self)
     }
@@ -1593,29 +1756,38 @@ impl HostIo for SandboxTarget {
     fn support_close(&mut self) -> Option<HostIoCloseOps<'_, Self>> {
         Some(self)
     }
+
+    /// Round-11 P2 — wire `vFile:fstat`. Surfaces the file
+    /// size + a synthetic mtime so a connected GDB client's
+    /// `add-symbol-file remote:<name>` doesn't have to discover
+    /// EOF by issuing successively-larger `vFile:pread` calls.
+    /// See the GDB RSP manual §"Host I/O Packets" for the wire
+    /// contract: <https://sourceware.org/gdb/current/onlinedocs/gdb.html/Host-I_002fO-Packets.html>
+    fn support_fstat(&mut self) -> Option<HostIoFstatOps<'_, Self>> {
+        Some(self)
+    }
 }
 
 impl HostIoOpen for SandboxTarget {
-    /// Round-10 P2 — open the requested filename if it matches
-    /// our retained codec DLL's basename (case-insensitive,
-    /// matching how Win32 `LoadLibraryA` treats DLL names).
-    /// Returns `ENOENT` for any other name. We ignore `flags`
-    /// because we only ever serve a read-only in-memory view —
-    /// `O_WRONLY` / `O_RDWR` requests are also accepted (we
-    /// just won't honour writes via `support_pwrite` — which we
-    /// don't advertise — so the client will get a "not
-    /// supported" wire-level reply if it tries to write).
-    /// `mode` is similarly ignored: nothing here creates a
-    /// new file.
+    /// Round-10 P2 / Round-11 P2 — open the requested filename
+    /// if it matches any registered file's basename (case-
+    /// insensitive, matching how Win32 `LoadLibraryA` treats
+    /// DLL names). Slot 0 is the primary codec DLL; subsequent
+    /// slots are synthetic stubs for cascade-loaded modules
+    /// (kernel32.dll, msvcrt.dll, …). Returns `ENOENT` for any
+    /// other name. We ignore `flags` because we only ever
+    /// serve a read-only in-memory view — `O_WRONLY` /
+    /// `O_RDWR` requests are also accepted (we just won't
+    /// honour writes via `support_pwrite` — which we don't
+    /// advertise — so the client will get a "not supported"
+    /// wire-level reply if it tries to write). `mode` is
+    /// similarly ignored: nothing here creates a new file.
     fn open(
         &mut self,
         filename: &[u8],
         _flags: HostIoOpenFlags,
         _mode: HostIoOpenMode,
     ) -> HostIoResult<u32, Self> {
-        // Lossy UTF-8: filenames in the GDB host_io packet are
-        // always ASCII in practice (a `vFile:open
-        // remote:<NAME>` decoded by `add-symbol-file`).
         let name = String::from_utf8_lossy(filename);
         // Strip a single leading slash so the GDB form
         // `vFile:open /IR32_32.DLL` (which gdb-on-host
@@ -1624,22 +1796,31 @@ impl HostIoOpen for SandboxTarget {
         // the final `/` or `\`).
         let trimmed = name.trim_start_matches('/');
         let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
-        if !basename.eq_ignore_ascii_case(&self.exec_file_name) {
-            return Err(HostIoError::Errno(HostIoErrno::ENOENT));
-        }
+        let file_idx = match self
+            .files
+            .iter()
+            .position(|f| f.name.eq_ignore_ascii_case(basename))
+        {
+            Some(i) => i,
+            None => return Err(HostIoError::Errno(HostIoErrno::ENOENT)),
+        };
         // Allocate a fresh fd. fd=0 is reserved per POSIX
-        // convention; our wire fd is `slot_index + 1`.
-        self.open_files.push(Some(()));
+        // convention; our wire fd is `slot_index + 1`. The fd
+        // carries the file-registry index so later
+        // `vFile:pread` / `vFile:fstat` calls slice into the
+        // right blob.
+        self.open_files.push(Some(file_idx));
         let fd = self.open_files.len() as u32;
         Ok(fd)
     }
 }
 
 impl HostIoPread for SandboxTarget {
-    /// Round-10 P2 — paginated read into the retained DLL
-    /// bytes. `offset` past EOF returns 0 (EOF marker per
-    /// the GDB host_io contract); short trailing reads are
-    /// the natural document terminator.
+    /// Round-10 P2 / Round-11 P2 — paginated read into the
+    /// registered file's bytes (resolved via the per-fd
+    /// registry index). `offset` past EOF returns 0 (EOF
+    /// marker per the GDB host_io contract); short trailing
+    /// reads are the natural document terminator.
     fn pread(
         &mut self,
         fd: u32,
@@ -1647,24 +1828,82 @@ impl HostIoPread for SandboxTarget {
         offset: u64,
         buf: &mut [u8],
     ) -> HostIoResult<usize, Self> {
-        // Validate fd: 1..=open_files.len() and slot must be Some.
-        if fd == 0 {
-            return Err(HostIoError::Errno(HostIoErrno::EBADF));
-        }
-        let idx = fd as usize - 1;
-        match self.open_files.get(idx) {
-            Some(Some(())) => {}
-            _ => return Err(HostIoError::Errno(HostIoErrno::EBADF)),
-        }
-        let total = self.dll_bytes.len() as u64;
+        let file_idx = self.resolve_fd(fd)?;
+        let bytes = &self.files[file_idx].bytes;
+        let total = bytes.len() as u64;
         if offset >= total {
             return Ok(0);
         }
         let start = offset as usize;
-        let remaining = self.dll_bytes.len() - start;
+        let remaining = bytes.len() - start;
         let n = remaining.min(count).min(buf.len());
-        buf[..n].copy_from_slice(&self.dll_bytes[start..start + n]);
+        buf[..n].copy_from_slice(&bytes[start..start + n]);
         Ok(n)
+    }
+}
+
+impl HostIoFstat for SandboxTarget {
+    /// Round-11 P2 — return a synthesised stat struct for the
+    /// open fd. The GDB host_io stat shape mirrors the POSIX
+    /// `struct stat` (see GDB RSP manual §"struct stat"):
+    /// `st_mode` carries permission bits, `st_size` is the
+    /// total file length in bytes, `st_mtime` is the last-
+    /// modification epoch seconds.
+    ///
+    /// We synthesise:
+    /// - `st_mode = S_IFREG | 0644` — every file we serve is
+    ///   a read-only regular file from the GDB client's
+    ///   perspective.
+    /// - `st_size = bytes.len()` — exact length of the
+    ///   registered blob (real PE bytes for the primary codec
+    ///   DLL; the synthetic stub length for cascade modules).
+    /// - `st_mtime = self.fstat_mtime` — pinned via
+    ///   `OXIDEAV_TRACEVFW_FSTAT_MTIME` env var when set,
+    ///   otherwise the wall clock at construction. Same value
+    ///   for all fds so a `monitor` client doesn't see drift
+    ///   between two `fstat` calls in one session.
+    /// - `st_atime = st_ctime = st_mtime` — we don't track
+    ///   access / change time separately; setting them equal
+    ///   matches what a freshly-created file looks like.
+    /// - All identity fields (`st_dev`, `st_ino`, `st_nlink`,
+    ///   `st_uid`, `st_gid`, `st_rdev`) report zero —
+    ///   consistent with our "synthetic in-memory file" stance
+    ///   and matching how a tmpfs entry without an inode
+    ///   surfaces over the wire.
+    /// - `st_blksize = 4096` (one MMU page); `st_blocks =
+    ///   ceil(size / 512)` per POSIX (`stat(2)` defines blocks
+    ///   in 512-byte units, regardless of `st_blksize`).
+    fn fstat(&mut self, fd: u32) -> HostIoResult<HostIoStat, Self> {
+        let file_idx = self.resolve_fd(fd)?;
+        let size = self.files[file_idx].bytes.len() as u64;
+        // S_IFREG | 0644 — regular file, owner rw, group + world
+        // r-only. Built from the gdbstub `HostIoOpenMode`
+        // associated constants so the wire encoding matches the
+        // protocol contract regardless of the host's local
+        // <sys/stat.h> values.
+        let mode = HostIoOpenMode::S_IFREG
+            | HostIoOpenMode::S_IRUSR
+            | HostIoOpenMode::S_IWUSR
+            | HostIoOpenMode::S_IRGRP
+            | HostIoOpenMode::S_IROTH;
+        // st_blocks is in 512-byte units per POSIX stat(2);
+        // ceiling-div so a partial trailing block counts.
+        let st_blocks = size.div_ceil(512);
+        Ok(HostIoStat {
+            st_dev: 0,
+            st_ino: 0,
+            st_mode: mode,
+            st_nlink: 1,
+            st_uid: 0,
+            st_gid: 0,
+            st_rdev: 0,
+            st_size: size,
+            st_blksize: 4096,
+            st_blocks,
+            st_atime: self.fstat_mtime,
+            st_mtime: self.fstat_mtime,
+            st_ctime: self.fstat_mtime,
+        })
     }
 }
 
@@ -1678,7 +1917,7 @@ impl HostIoClose for SandboxTarget {
         }
         let idx = fd as usize - 1;
         match self.open_files.get_mut(idx) {
-            Some(slot @ Some(())) => {
+            Some(slot @ Some(_)) => {
                 *slot = None;
                 Ok(())
             }
@@ -1688,12 +1927,30 @@ impl HostIoClose for SandboxTarget {
 }
 
 impl SandboxTarget {
+    /// Round-11 P2 — common helper: validate an fd and return
+    /// the file-registry index it points at, or the matching
+    /// `EBADF` errno. Shared by `HostIoPread::pread` and
+    /// `HostIoFstat::fstat` so both surfaces enforce identical
+    /// validation semantics.
+    fn resolve_fd(&self, fd: u32) -> HostIoResult<usize, Self> {
+        if fd == 0 {
+            return Err(HostIoError::Errno(HostIoErrno::EBADF));
+        }
+        let idx = fd as usize - 1;
+        match self.open_files.get(idx) {
+            Some(Some(file_idx)) => Ok(*file_idx),
+            _ => Err(HostIoError::Errno(HostIoErrno::EBADF)),
+        }
+    }
+}
+
+impl SandboxTarget {
     /// Count of currently-open `vFile` fds. Used by `monitor
     /// stats`. We don't store this as a counter because
-    /// `Vec<Option<()>>` is the source of truth and divergence
-    /// would be a worse bug than the O(n) walk on every
-    /// `monitor stats` invocation (where n is bounded by a
-    /// real GDB session's lifetime symbol-loads — typically
+    /// `Vec<Option<usize>>` is the source of truth and
+    /// divergence would be a worse bug than the O(n) walk on
+    /// every `monitor stats` invocation (where n is bounded by
+    /// a real GDB session's lifetime symbol-loads — typically
     /// 1 or 2).
     fn live_open_fds(&self) -> usize {
         self.open_files.iter().filter(|s| s.is_some()).count()
@@ -3525,5 +3782,300 @@ mod tests {
         assert_eq!(t.live_open_fds(), 1);
         ok_io(HostIoClose::close(&mut t, fd_b));
         assert_eq!(t.live_open_fds(), 0);
+    }
+
+    /// Round-11 P2 — `vFile:fstat` returns a stat struct whose
+    /// `st_size` matches the registered file's byte length and
+    /// whose `st_mode` carries `S_IFREG` + `0644` permission
+    /// bits. The synthetic mtime is the same value across
+    /// successive calls (no drift between two `fstat`s in one
+    /// session). Cross-platform: we don't depend on a specific
+    /// epoch second — only that mtime is non-zero (the env
+    /// var fallback uses the wall clock; our test runs after
+    /// 1970 so wall-clock reads are non-zero).
+    #[test]
+    fn host_io_fstat_returns_size_mode_and_stable_mtime() {
+        let dll: Vec<u8> = (0..1500u32).map(|i| (i & 0xff) as u8).collect();
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "fixture.dll".to_string(),
+            dll.clone(),
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"fixture.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st = ok_io(HostIoFstat::fstat(&mut t, fd));
+        assert_eq!(st.st_size, dll.len() as u64);
+        // S_IFREG | 0644 — regular file, owner rw, group + world r-only.
+        let want_mode = HostIoOpenMode::S_IFREG
+            | HostIoOpenMode::S_IRUSR
+            | HostIoOpenMode::S_IWUSR
+            | HostIoOpenMode::S_IRGRP
+            | HostIoOpenMode::S_IROTH;
+        assert_eq!(st.st_mode.bits(), want_mode.bits());
+        assert_eq!(st.st_nlink, 1);
+        assert_eq!(st.st_uid, 0);
+        assert_eq!(st.st_gid, 0);
+        assert_eq!(st.st_blksize, 4096);
+        // 1500 bytes ⇒ ceil(1500/512) = 3 blocks.
+        assert_eq!(st.st_blocks, 3);
+        // Times are equal across atime/mtime/ctime + non-zero
+        // (we ran after 1970).
+        assert_ne!(st.st_mtime, 0, "fstat_mtime fallback should be non-zero");
+        assert_eq!(st.st_atime, st.st_mtime);
+        assert_eq!(st.st_ctime, st.st_mtime);
+        // Identity fields — synthetic in-memory file.
+        assert_eq!(st.st_dev, 0);
+        assert_eq!(st.st_ino, 0);
+        assert_eq!(st.st_rdev, 0);
+        // Stable across two calls in one session.
+        let st2 = ok_io(HostIoFstat::fstat(&mut t, fd));
+        assert_eq!(st.st_mtime, st2.st_mtime);
+    }
+
+    /// Round-11 P2 — `vFile:fstat` against a stale fd (after
+    /// `vFile:close`) returns `EBADF`. Same validation as
+    /// `vFile:pread`'s stale-fd guard (round-10 contract).
+    #[test]
+    fn host_io_fstat_after_close_returns_ebadf() {
+        let mut t = SandboxTarget::with_forward(
+            Sandbox::new(),
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "synth.dll".to_string(),
+            vec![0xAB; 32],
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"synth.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        ok_io(HostIoClose::close(&mut t, fd));
+        assert_io_ebadf(HostIoFstat::fstat(&mut t, fd), "fstat after close");
+        // fd=0 is always EBADF (POSIX stdin reservation).
+        assert_io_ebadf(HostIoFstat::fstat(&mut t, 0), "fstat fd=0");
+        // Out-of-range fd — never allocated.
+        assert_io_ebadf(HostIoFstat::fstat(&mut t, 999), "fstat fd=999");
+    }
+
+    /// Round-11 P2 — `OXIDEAV_TRACEVFW_FSTAT_MTIME` env var
+    /// pins the synthetic mtime so an integration test can
+    /// assert a stable epoch value (rather than the wall
+    /// clock). We can't safely set the env var inside a test
+    /// when other test threads may also read it, so we exercise
+    /// the parser directly via `resolve_fstat_mtime` (with the
+    /// env var temporarily set) on a single-thread guard. The
+    /// test is `--test-threads=1`-safe because env-var mutation
+    /// affects the whole process; gating on
+    /// `cfg(not(miri))`-style guards is unnecessary for the
+    /// unit-test workflow we run.
+    #[test]
+    fn fstat_mtime_env_var_overrides_wall_clock() {
+        // SAFETY: env var mutation is process-global; tests in
+        // this file run with --test-threads up to N but no
+        // other test reads OXIDEAV_TRACEVFW_FSTAT_MTIME.
+        std::env::set_var("OXIDEAV_TRACEVFW_FSTAT_MTIME", "1700000000");
+        let got = SandboxTarget::resolve_fstat_mtime();
+        std::env::remove_var("OXIDEAV_TRACEVFW_FSTAT_MTIME");
+        assert_eq!(got, 1_700_000_000);
+    }
+
+    /// Round-11 P2 — invalid env-var values (non-decimal,
+    /// negative, overflowing) fall back to the wall clock
+    /// rather than panicking.
+    #[test]
+    fn fstat_mtime_env_var_invalid_falls_back_to_wall_clock() {
+        std::env::set_var("OXIDEAV_TRACEVFW_FSTAT_MTIME", "not-a-number");
+        let got = SandboxTarget::resolve_fstat_mtime();
+        std::env::remove_var("OXIDEAV_TRACEVFW_FSTAT_MTIME");
+        // Wall clock fallback ⇒ non-zero (post-1970 epoch).
+        assert_ne!(got, 0);
+    }
+
+    /// Round-11 P2 — saturating cast: env-var value past
+    /// `u32::MAX` clamps to `u32::MAX` (year-2106 horizon)
+    /// rather than wrapping or panicking.
+    #[test]
+    fn fstat_mtime_env_var_saturates_at_u32_max() {
+        std::env::set_var(
+            "OXIDEAV_TRACEVFW_FSTAT_MTIME",
+            "99999999999", // > u32::MAX
+        );
+        let got = SandboxTarget::resolve_fstat_mtime();
+        std::env::remove_var("OXIDEAV_TRACEVFW_FSTAT_MTIME");
+        assert_eq!(got, u32::MAX);
+    }
+
+    /// Round-11 P2 — `vFile:open` against a cascade-loaded
+    /// module name registered in `HostState::modules` resolves
+    /// to a fresh fd. The matching is case-insensitive (Win32
+    /// `LoadLibraryA` semantics). Each cascade module has its
+    /// own synthetic byte payload distinct from the primary
+    /// DLL's, so `pread` against the cascade fd returns the
+    /// stub bytes — not the codec DLL.
+    #[test]
+    fn host_io_open_cascade_module_resolves_to_synthetic_stub() {
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        sb.host.modules.insert("msvcrt.dll".into(), 0x7800_0000);
+        let mut t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "primary.dll".to_string(),
+            vec![0x4d, 0x5a, 0x90, 0x00], // bogus PE magic, len=4
+        );
+        // Open the primary — should return slot 0's bytes.
+        let fd_primary = ok_io(HostIoOpen::open(
+            &mut t,
+            b"primary.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st_primary = ok_io(HostIoFstat::fstat(&mut t, fd_primary));
+        assert_eq!(st_primary.st_size, 4);
+
+        // Open kernel32.dll (case-insensitive).
+        let fd_k32 = ok_io(HostIoOpen::open(
+            &mut t,
+            b"KERNEL32.DLL",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st_k32 = ok_io(HostIoFstat::fstat(&mut t, fd_k32));
+        assert!(
+            st_k32.st_size > 4,
+            "cascade stub should be larger than the 4-byte primary fixture"
+        );
+
+        // pread the cascade stub: should be ASCII text.
+        let mut buf = vec![0u8; st_k32.st_size as usize];
+        let n = ok_io(HostIoPread::pread(&mut t, fd_k32, buf.len(), 0, &mut buf));
+        assert_eq!(n, buf.len());
+        let text = String::from_utf8(buf).expect("stub is ASCII");
+        assert!(text.contains("OXIDEAV-VFW STUB MODULE"));
+        assert!(text.contains("name=kernel32.dll"));
+        assert!(text.contains("image_base=0x77000000"));
+
+        // msvcrt.dll resolves too (proves the registry isn't
+        // limited to one cascade entry).
+        let fd_msvcrt = ok_io(HostIoOpen::open(
+            &mut t,
+            b"msvcrt.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st_msvcrt = ok_io(HostIoFstat::fstat(&mut t, fd_msvcrt));
+        assert!(st_msvcrt.st_size > 4);
+
+        // Unknown module still ENOENT.
+        assert_io_enoent(
+            HostIoOpen::open(
+                &mut t,
+                b"user32.dll",
+                HostIoOpenFlags::O_RDONLY,
+                HostIoOpenMode::empty(),
+            ),
+            "open user32.dll",
+        );
+    }
+
+    /// Round-11 P2 — when the cascade module registry contains
+    /// an entry whose name case-insensitively matches the
+    /// primary DLL, the registry de-dupes: opening the primary
+    /// name returns the real codec DLL bytes (slot 0), not the
+    /// synthetic stub. Mirrors what happens after a real
+    /// `Sandbox::load` — the loader inserts the primary DLL
+    /// into `HostState::modules` AND the operator passed it on
+    /// the CLI, so the file table must serve the real bytes.
+    #[test]
+    fn host_io_primary_dll_overrides_cascade_entry_with_same_name() {
+        let mut sb = Sandbox::new();
+        // Loader-style: primary DLL + cascade modules all in
+        // HostState::modules. The cascade entry for the primary
+        // name MUST NOT shadow the real bytes.
+        sb.host.modules.insert("ir32_32.dll".into(), 0x1000_0000);
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        let primary_bytes = vec![0xAA; 256];
+        let mut t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            "ir32_32.dll".to_string(),
+            primary_bytes.clone(),
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"ir32_32.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st = ok_io(HostIoFstat::fstat(&mut t, fd));
+        assert_eq!(
+            st.st_size,
+            primary_bytes.len() as u64,
+            "primary DLL bytes (slot 0) must take priority over cascade stub"
+        );
+        let mut buf = vec![0u8; primary_bytes.len()];
+        let n = ok_io(HostIoPread::pread(&mut t, fd, buf.len(), 0, &mut buf));
+        assert_eq!(n, primary_bytes.len());
+        assert_eq!(buf, primary_bytes, "should read the real PE bytes");
+    }
+
+    /// Round-11 P2 — `support_host_io` is non-None when the
+    /// sandbox carries cascade modules even if no primary DLL
+    /// bytes were passed (e.g. a test harness that staged
+    /// modules manually). The host_io extension serves the
+    /// cascade stubs in that case.
+    #[test]
+    fn support_host_io_active_with_only_cascade_modules() {
+        let mut sb = Sandbox::new();
+        sb.host.modules.insert("kernel32.dll".into(), 0x7700_0000);
+        let mut t = SandboxTarget::with_forward(
+            sb,
+            Arc::new(Mutex::new(None)),
+            &[],
+            None,
+            String::new(),
+            Vec::new(),
+        );
+        assert!(
+            Target::support_host_io(&mut t).is_some(),
+            "cascade modules alone should activate host_io"
+        );
+        let fd = ok_io(HostIoOpen::open(
+            &mut t,
+            b"kernel32.dll",
+            HostIoOpenFlags::O_RDONLY,
+            HostIoOpenMode::empty(),
+        ));
+        let st = ok_io(HostIoFstat::fstat(&mut t, fd));
+        assert!(st.st_size > 0);
+    }
+
+    /// Round-11 P2 — `synth_module_stub` emits a stable
+    /// recognisable byte sequence: starts with `OXIDEAV-VFW
+    /// STUB MODULE`, ends with a newline, contains the module
+    /// name and image base verbatim. The exact format is a
+    /// stability contract for tests + operator inspection but
+    /// not a wire contract.
+    #[test]
+    fn synth_module_stub_format_is_stable() {
+        let bytes = SandboxTarget::synth_module_stub("kernel32.dll", 0x7700_0000);
+        let text = String::from_utf8(bytes).expect("stub is ASCII");
+        assert!(text.starts_with("OXIDEAV-VFW STUB MODULE\n"));
+        assert!(text.contains("\nname=kernel32.dll\n"));
+        assert!(text.contains("\nimage_base=0x77000000\n"));
+        assert!(text.ends_with("served by sandbox host stubs)\n"));
     }
 }

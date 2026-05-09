@@ -50,7 +50,9 @@ oxidetracevfw IR32_32.DLL --gdb 0.0.0.0:1234
 #   (gdb) monitor breakpoints   # round 10: list registered SW breakpoints
 #   (gdb) monitor watches       # round 10: list registered HW watchpoints
 #   (gdb) monitor modules       # round 10: list loaded PE modules
+#   (gdb) monitor files         # round 11: list host_io files (vFile:open targets)
 #   (gdb) add-symbol-file remote:IR32_32.DLL  # round 10: fetch DLL bytes via vFile:open/pread
+#   (gdb) add-symbol-file remote:kernel32.dll # round 11: cascade module synthetic stub
 #   (gdb) detach
 ```
 

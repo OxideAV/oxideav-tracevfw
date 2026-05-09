@@ -1999,6 +1999,11 @@ fn qrcmd_monitor_commands_return_sandbox_state() {
         out.contains("cli_breakpoints=1"),
         "monitor stats expected cli_breakpoints=1 (we passed --break), got: {out:?}"
     );
+    // Round-11 P2 — host_io_files counter exposed by `monitor stats`.
+    assert!(
+        out.contains("host_io_files="),
+        "monitor stats missing host_io_files: {out:?}"
+    );
 
     // 3. monitor breakpoints — lists the CLI-registered PC.
     sock.write_all(&rcmd("breakpoints"))
@@ -2039,7 +2044,19 @@ fn qrcmd_monitor_commands_return_sandbox_state() {
         "monitor watches expected empty placeholder, got: {out:?}"
     );
 
-    // 6. unknown command — informative reply, still OK.
+    // 6. monitor files (round-11 P2) — lists the host_io
+    //    file registry. Always at least one entry when we
+    //    passed a DLL on the CLI.
+    sock.write_all(&rcmd("files")).expect("write monitor files");
+    let (out, term) = drain_monitor_output(&mut sock);
+    assert_eq!(term, "OK");
+    let lower = out.to_ascii_lowercase();
+    assert!(
+        lower.contains("kind=primary") || lower.contains(".dll") || lower.contains(".ax"),
+        "monitor files expected at least the primary entry, got: {out:?}"
+    );
+
+    // 7. unknown command — informative reply, still OK.
     sock.write_all(&rcmd("frobnicate"))
         .expect("write monitor frobnicate");
     let (out, term) = drain_monitor_output(&mut sock);
@@ -2298,6 +2315,214 @@ fn vfile_open_pread_close_round_trips_dll_bytes() {
     let errno =
         i64::from_str_radix(errno_str, 16).unwrap_or_else(|_| panic!("parse errno: {resp:?}"));
     assert_eq!(errno, 2, "expected ENOENT (2), got {errno} in {resp:?}");
+
+    sock.write_all(&rsp_packet("D")).expect("write D");
+    let _ = read_packet_raw(&mut sock);
+    drop(sock);
+    let _ = child.wait();
+}
+
+/// Round-11 P2 — host_io `vFile:fstat` returns a stat struct
+/// whose `st_size` matches the DLL byte length. The reply
+/// shape per the GDB RSP manual §"Host I/O Packets":
+///
+/// `Fcount;<binary-stat-payload>` — `count` is the number of
+/// bytes in the payload (lowercase hex), and the payload is a
+/// 64-byte big-endian struct in the gdbstub 0.7 wire format:
+/// fields packed in declaration order (st_dev, st_ino,
+/// st_mode, st_nlink, st_uid, st_gid, st_rdev, st_size,
+/// st_blksize, st_blocks, st_atime, st_mtime, st_ctime).
+///
+/// We assert that the binary-decoded `st_size` equals the
+/// DLL byte length and that the size header (`count`) is
+/// 64 bytes. The exact bit-packing of `st_mode` is gdbstub-
+/// internal and we don't second-guess it from the wire — the
+/// unit test `host_io_fstat_returns_size_mode_and_stable_mtime`
+/// covers the in-memory `HostIoStat` shape directly.
+#[test]
+fn vfile_fstat_returns_size_struct() {
+    use std::io::{BufRead, BufReader, Read, Write as _};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let dll = write_synth_dll();
+    let dll_path = dll.path().to_path_buf();
+    let dll_bytes = std::fs::read(&dll_path).expect("read synth dll");
+    let basename = dll_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("basename")
+        .to_string();
+
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let mut child = Command::new(bin)
+        .arg(&dll_path)
+        .arg("--gdb")
+        .arg("127.0.0.1:0")
+        .env("OXIDEAV_TRACEVFW_FSTAT_MTIME", "1700000000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxidetracevfw");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut port: Option<u16> = None;
+    let mut buffered = String::new();
+    for _ in 0..32 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        buffered.push_str(&line);
+        if let Some(idx) = line.find("listening on ") {
+            let rest = &line[idx + "listening on ".len()..];
+            if let Some(colon) = rest.rfind(':') {
+                port = rest[colon + 1..].trim().parse::<u16>().ok();
+            }
+            break;
+        }
+    }
+    let port = port.unwrap_or_else(|| {
+        let _ = child.kill();
+        panic!("no listening line; stderr: {buffered}");
+    });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    fn rsp_packet(payload: &str) -> Vec<u8> {
+        let mut sum: u32 = 0;
+        for &b in payload.as_bytes() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        let mut out = Vec::with_capacity(payload.len() + 4);
+        out.push(b'$');
+        out.extend_from_slice(payload.as_bytes());
+        out.push(b'#');
+        out.extend_from_slice(format!("{:02x}", sum & 0xff).as_bytes());
+        out
+    }
+
+    fn read_packet_raw(sock: &mut TcpStream) -> Vec<u8> {
+        let mut buf = [0u8; 1];
+        loop {
+            sock.read_exact(&mut buf).expect("read ack/start");
+            if buf[0] == b'$' {
+                break;
+            }
+            if buf[0] != b'+' && buf[0] != b'-' {
+                break;
+            }
+        }
+        let mut payload = Vec::new();
+        loop {
+            sock.read_exact(&mut buf).expect("read payload");
+            if buf[0] == b'#' {
+                break;
+            }
+            if buf[0] == b'}' {
+                let mut esc = [0u8; 1];
+                sock.read_exact(&mut esc).expect("read escape byte");
+                payload.push(esc[0] ^ 0x20);
+                continue;
+            }
+            if buf[0] == b'*' {
+                let mut nb = [0u8; 1];
+                sock.read_exact(&mut nb).expect("read RLE count");
+                let n = (nb[0] as i32 - 29).max(0) as usize;
+                if let Some(&last) = payload.last() {
+                    for _ in 0..n {
+                        payload.push(last);
+                    }
+                }
+                continue;
+            }
+            payload.push(buf[0]);
+        }
+        let mut csum = [0u8; 2];
+        sock.read_exact(&mut csum).expect("read checksum");
+        sock.write_all(b"+").expect("write ack");
+        payload
+    }
+
+    sock.write_all(&rsp_packet("qSupported:multiprocess+;swbreak+"))
+        .expect("write qSupported");
+    let _ = read_packet_raw(&mut sock);
+
+    // 1. vFile:open
+    let name_hex: String = basename
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    sock.write_all(&rsp_packet(&format!("vFile:open:{name_hex},0,0")))
+        .expect("write open");
+    let resp = String::from_utf8_lossy(&read_packet_raw(&mut sock)).into_owned();
+    assert!(resp.starts_with('F'), "open: {resp:?}");
+    let body = &resp[1..];
+    let fd_str = body.split(',').next().unwrap_or("");
+    let fd = i64::from_str_radix(fd_str, 16).unwrap_or_else(|_| panic!("parse fd: {resp:?}"));
+    assert!(fd >= 1, "fd: {fd}");
+
+    // 2. vFile:fstat
+    sock.write_all(&rsp_packet(&format!("vFile:fstat:{fd:x}")))
+        .expect("write fstat");
+    let raw = read_packet_raw(&mut sock);
+    // Reply: `F<count>;<binary-stat-payload>`. Find the `;`
+    // that ends the count prefix.
+    let semi = raw
+        .iter()
+        .position(|&b| b == b';')
+        .unwrap_or_else(|| panic!("no ';' in fstat reply: {:?}", String::from_utf8_lossy(&raw)));
+    let header = &raw[..semi];
+    let stat_bytes = &raw[semi + 1..];
+    assert_eq!(header[0], b'F', "expected 'F<count>' header");
+    let count_hex = std::str::from_utf8(&header[1..]).expect("count utf8");
+    let n = usize::from_str_radix(count_hex, 16).expect("parse count");
+    // The GDB host_io stat struct is exactly 64 bytes per
+    // gdbstub 0.7's wire layout (13 fields totalling 64 bytes).
+    assert_eq!(n, 64, "expected 64-byte stat struct, got {n} bytes");
+    assert_eq!(stat_bytes.len(), 64, "payload length mismatch");
+
+    // st_size is at offset 32 (after st_dev/u32 + st_ino/u32 +
+    // st_mode/u32 + st_nlink/u32 + st_uid/u32 + st_gid/u32 +
+    // st_rdev/u32 + 4-byte alignment pad? — in gdbstub 0.7 the
+    // wire is packed big-endian without explicit padding).
+    // Layout per gdbstub 0.7 (fields packed in declaration order
+    // big-endian):
+    //   st_dev    u32  @ 0
+    //   st_ino    u32  @ 4
+    //   st_mode   u32  @ 8
+    //   st_nlink  u32  @ 12
+    //   st_uid    u32  @ 16
+    //   st_gid    u32  @ 20
+    //   st_rdev   u32  @ 24
+    //   st_size   u64  @ 28
+    //   st_blksize u64 @ 36
+    //   st_blocks u64  @ 44
+    //   st_atime  u32  @ 52
+    //   st_mtime  u32  @ 56
+    //   st_ctime  u32  @ 60
+    let st_size = u64::from_be_bytes(stat_bytes[28..36].try_into().unwrap());
+    assert_eq!(
+        st_size,
+        dll_bytes.len() as u64,
+        "st_size should equal DLL byte length"
+    );
+    let st_mtime = u32::from_be_bytes(stat_bytes[56..60].try_into().unwrap());
+    assert_eq!(
+        st_mtime, 1_700_000_000,
+        "OXIDEAV_TRACEVFW_FSTAT_MTIME env var should pin st_mtime"
+    );
+
+    sock.write_all(&rsp_packet(&format!("vFile:close:{fd:x}")))
+        .expect("write close");
+    let _ = read_packet_raw(&mut sock);
 
     sock.write_all(&rsp_packet("D")).expect("write D");
     let _ = read_packet_raw(&mut sock);
