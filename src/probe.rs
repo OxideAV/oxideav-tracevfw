@@ -68,12 +68,12 @@ pub fn run(sandbox: &mut Sandbox, dll_path: &Path, fcc_handler: Option<&str>) ->
         return Ok(());
     }
 
-    // `vfw32::ICINFO` is 112 bytes (4 dwords + 64 wchar szName +
-    // 32 wchar szDescription + … etc — we ask for the full
-    // structure, which the round-17 short-return fallback in
-    // oxideav-vfw will fill in if the codec returns less).
-    const ICINFO_SIZE: u32 = 112;
-    let icinfo = sandbox.ic_get_info(hic, ICINFO_SIZE).context("ICGetInfo")?;
+    // `vfw32::ICINFO` total size — see `oxideav_vfw::win32::vfw32::ICINFO_SIZE`
+    // (= 568). Strict-codec gate from oxideav-vfw round 24 / r67: callers
+    // MUST pass `cb >= 568`; mpg4c32.dll returns 0 bytes when `cb` is short.
+    let icinfo = sandbox
+        .ic_get_info(hic, oxideav_vfw::win32::vfw32::ICINFO_SIZE)
+        .context("ICGetInfo")?;
     println!(
         "[probe] ICGetInfo returned {} bytes; first 32 = {}",
         icinfo.len(),
