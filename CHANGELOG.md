@@ -8,6 +8,60 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 5 P3 — `encode` subcommand wired to `ICCompress*` (P1).**
+  The `encode` subcommand now drives the full
+  `ICOpen(ICMODE_COMPRESS)` → `ICCompressQuery` →
+  `ICCompressGetFormat` → `ICCompressGetSize` → `ICCompressBegin` →
+  `ICCompress` → `ICCompressEnd` → `ICClose` lifecycle against
+  any VfW codec that accepts compress mode. Mirrors `decode.rs`'s
+  structure exactly — same load/install_codec preamble, same
+  per-stage `[encode] …` logging, same `--fcc-handler` /
+  `--trace-output` / `--break` / `--gdb` interaction surface.
+
+  New flags on the `encode` subcommand:
+  - `--input FILE` — raw uncompressed pixel bytes (header-less);
+    when absent, the existing `--pattern` synthetic generator
+    runs instead.
+  - `--input-format {bgr24,bgr32,yv12,i420,yuy2}` — `Bgr24` is
+    the default, matching what most VfW codecs accept as natural
+    encode input.
+  - `--quality N` — `0..=10000` per the `ICCOMPRESS::dwQuality`
+    convention; default `5000`.
+  - `--keyframe BOOL` — sets `ICCOMPRESS_KEYFRAME` in `dwFlags`;
+    default `true` (first-frame encode must be a keyframe).
+  - `--output-fourcc FCC` — operator override for the output
+    BIH's `biCompression`; when omitted, the codec's
+    `ICCompressGetFormat` reply is honoured.
+
+  Wired against **`oxideav-vfw r51`** (commit `dcc9c37`), which
+  landed `Sandbox::ic_compress_query` /
+  `ic_compress_get_format` / `ic_compress_get_size` /
+  `ic_compress_begin` / `ic_compress` / `ic_compress_end`. The
+  round-3 stub's "blocked on a cross-crate followup" diagnostic
+  is removed — the followup is resolved.
+
+  Per-crate `ICMODE_COMPRESS` constant corrected from `2` to `1`
+  (vfw.h canonical mapping; the earlier round-3 stub had `1` and
+  `2` transposed against `ICMODE_DECOMPRESS`).
+
+  Two new integration tests in `tests/encode_subcommand.rs`:
+  `encode_subcommand_against_mpg4c32_produces_nonempty_output`
+  and `encode_then_decode_roundtrip_via_cli_clears_psnr_floor`
+  invoke the binary against `mpg4c32.dll` (when the docs/ fixture
+  is present), pipe a 176×144 BGR24 gradient through encode,
+  then re-decode the encoded bytes and assert
+  `PSNR-BGR24 ≥ 15 dB`. Empirical: **27.83 dB**, matching the
+  oxideav-vfw round-51 producer-side test exactly. Both tests
+  skip gracefully (`[encode-mpg4c32] skipped: …`) when the
+  fixture is absent.
+
+  The existing synthetic-DLL CLI tests
+  (`encode_subcommand_drives_ic_compress_path`,
+  `encode_subcommand_accepts_quality_and_keyframe_flags`) now
+  assert the path attempts `ICCompress*` (surfacing
+  `install_codec` failure on the DriverProc-less synth DLL)
+  rather than the prior blocker-message check.
+
 - **Round 15 — IMAGE_IMPORT_DIRECTORY (DataDirectory[1]) + env-var
   test serialisation.** The synthesised cascade-module PE bytes now
   carry a fourth section, `.idata`, declaring the cross-module

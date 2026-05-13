@@ -82,25 +82,61 @@ pub enum Command {
     /// form. The default subcommand if none supplied.
     Probe,
 
-    /// Drive `ICCompress` on synthetic input. Round-1 stub
-    /// passes the synthetic frame through `vfw32::ic_*` and
-    /// reports any traps / errors; full encode pipeline lands
-    /// when the encoder side of the host shim grows.
+    /// Drive `ICCompress` on uncompressed-pixel input. The
+    /// full lifecycle (ICCompressQuery → ICCompressGetFormat →
+    /// ICCompressGetSize → ICCompressBegin → ICCompress →
+    /// ICCompressEnd) runs against any codec that accepts
+    /// `ICMODE_COMPRESS` at `DRV_OPEN`. Wired against
+    /// `oxideav-vfw r51`.
     Encode {
-        /// Synthetic input width.
+        /// Path to a raw uncompressed pixel file (no header — bytes
+        /// only). If omitted, the subcommand generates a synthetic
+        /// pattern (see `--pattern` / `--width` / `--height`) instead.
+        #[arg(long, value_name = "FILE")]
+        input: Option<PathBuf>,
+
+        /// Input frame width (pixels). Used for both raw input
+        /// files and synthetic patterns.
         #[arg(long, default_value_t = 320)]
         width: u32,
 
-        /// Synthetic input height.
+        /// Input frame height (pixels).
         #[arg(long, default_value_t = 240)]
         height: u32,
 
-        /// Synthetic-frame pattern.
+        /// Uncompressed-input pixel format. The default matches
+        /// what most VfW encoders accept as natural input.
+        #[arg(long = "input-format", value_enum, default_value_t = InputFormat::Bgr24)]
+        input_format: InputFormat,
+
+        /// Synthetic-frame pattern. Only consulted when `--input`
+        /// is absent (i.e. we synthesise the input instead of
+        /// reading it from disk).
         #[arg(long, value_enum, default_value_t = Pattern::Gradient)]
         pattern: Pattern,
 
-        /// Output file for the encoded frame. Defaults to
-        /// stdout.
+        /// Encoder quality, scaled `0..=10000` per the VfW
+        /// convention (`ICCOMPRESS::dwQuality`). The codec may
+        /// clamp; values outside the range are passed through
+        /// unchanged.
+        #[arg(long, default_value_t = 5000)]
+        quality: u32,
+
+        /// Request a keyframe (sets `ICCOMPRESS_KEYFRAME` in
+        /// `dwFlags`). Default `true` — the first frame of an
+        /// encode session must be a keyframe; the codec is also
+        /// free to override this and emit a keyframe regardless.
+        /// Accepts `true` / `false` / `1` / `0`.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        keyframe: bool,
+
+        /// FourCC the codec should emit on the output BIH. When
+        /// omitted, falls back to the codec's `ICCompressGetFormat`
+        /// reply (the codec picks).
+        #[arg(long = "output-fourcc", value_name = "FCC")]
+        output_fourcc: Option<String>,
+
+        /// Output file for the encoded frame. Defaults to stdout.
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
@@ -149,6 +185,60 @@ pub enum PixFormat {
     Rgb24,
     Rgb32,
     Yuv,
+}
+
+/// Uncompressed pixel formats accepted by the `encode` subcommand
+/// as input. `Bgr24` follows the Windows BMP convention (BGR-packed,
+/// bottom-up rows) and is what most VfW encoders advertise as their
+/// natural input.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum InputFormat {
+    /// 24 bits per pixel, packed B,G,R bytes, bottom-up rows.
+    /// `biCompression = BI_RGB (0)`, `biBitCount = 24`.
+    Bgr24,
+    /// 32 bits per pixel, packed B,G,R,X bytes, bottom-up rows.
+    Bgr32,
+    /// Planar YV12 (Y, V, U planes), `biCompression = 'YV12'`,
+    /// `biBitCount = 12`.
+    Yv12,
+    /// Planar I420 (Y, U, V planes), `biCompression = 'I420'`,
+    /// `biBitCount = 12`.
+    I420,
+    /// Packed YUY2, `biCompression = 'YUY2'`, `biBitCount = 16`.
+    Yuy2,
+}
+
+impl InputFormat {
+    /// `biBitCount` for this format.
+    pub fn bi_bit_count(self) -> u16 {
+        match self {
+            InputFormat::Bgr24 => 24,
+            InputFormat::Bgr32 => 32,
+            InputFormat::Yv12 | InputFormat::I420 => 12,
+            InputFormat::Yuy2 => 16,
+        }
+    }
+
+    /// `biCompression` for this format (4 raw bytes).
+    pub fn bi_compression(self) -> [u8; 4] {
+        match self {
+            InputFormat::Bgr24 | InputFormat::Bgr32 => [0; 4], // BI_RGB
+            InputFormat::Yv12 => *b"YV12",
+            InputFormat::I420 => *b"I420",
+            InputFormat::Yuy2 => *b"YUY2",
+        }
+    }
+
+    /// Bytes per uncompressed frame for `width × height`.
+    pub fn frame_bytes(self, width: u32, height: u32) -> u32 {
+        let pixels = width.saturating_mul(height);
+        match self {
+            InputFormat::Bgr24 => pixels * 3,
+            InputFormat::Bgr32 => pixels * 4,
+            InputFormat::Yv12 | InputFormat::I420 => pixels * 3 / 2,
+            InputFormat::Yuy2 => pixels * 2,
+        }
+    }
 }
 
 impl PixFormat {

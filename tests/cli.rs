@@ -788,17 +788,21 @@ fn trace_mem_flag_parses() {
 }
 
 #[test]
-fn encode_subcommand_documents_iccompress_blocker_in_output() {
-    // Round-3 P3: ICCompress wiring is blocked on a cross-crate
-    // followup (`oxideav-vfw 0.1.0` ships only the decompress
-    // half of the host surface). The encode subcommand should
-    // surface that fact in its console output so an operator
-    // running it doesn't expect a fully-driven encode.
+fn encode_subcommand_drives_ic_compress_path() {
+    // Round-5 P1: the `encode` subcommand wires through to
+    // `Sandbox::ic_open(ICMODE_COMPRESS)` +
+    // `Sandbox::ic_compress_query` + `Sandbox::ic_compress_get_format`
+    // + `Sandbox::ic_compress_get_size` + `Sandbox::ic_compress_begin`
+    // + `Sandbox::ic_compress` + `Sandbox::ic_compress_end`
+    // (oxideav-vfw r51).
     //
-    // Synthetic DLL has no DriverProc → install_codec fails →
-    // anyhow propagates the error. Exit non-zero is OK; we just
-    // assert the subcommand's pre-error output mentions the
-    // blocker.
+    // The synthetic DLL doesn't expose `DriverProc`, so
+    // `install_codec` surfaces the error and we exit non-zero —
+    // the outer CLI propagates the anyhow error. We still want
+    // to verify the subcommand at least *attempts* the encode
+    // path; this test asserts the produced diagnostic mentions
+    // DriverProc / install_codec, proving we got past the load
+    // + DllMain stage.
     let dll = write_synth_dll();
     let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
     let out = Command::new(bin)
@@ -810,17 +814,59 @@ fn encode_subcommand_documents_iccompress_blocker_in_output() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}{stderr}");
-    // Either the synth-DLL DriverProc-missing error, or — if
-    // `install_codec` ever stops being a hard error — our own
-    // "blocked on cross-crate followup" diagnostic. Either way,
-    // the user gets a clear signal.
+    // Synthetic DLL has no DriverProc — the error chain should
+    // reflect that (or alternatively surface DRV_OPEN /
+    // ICCompress* / ICOpen). The "blocked on cross-crate
+    // followup" diagnostic is no longer emitted in round 5.
     assert!(
-        combined.contains("ICCompress")
-            || combined.to_lowercase().contains("driverproc")
+        combined.to_lowercase().contains("driverproc")
+            || combined.to_lowercase().contains("drv_open")
             || combined.contains("install_codec")
-            || combined.contains("DRV_OPEN"),
-        "expected encode subcommand to mention ICCompress or surface \
-         DriverProc/DRV_OPEN — got:\nstdout: {stdout}\nstderr: {stderr}"
+            || combined.contains("ICCompress")
+            || combined.contains("ICOpen"),
+        "expected encode subcommand to surface a codec-side \
+         error mentioning DriverProc / DRV_OPEN / ICCompress / ICOpen \
+         — got:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn encode_subcommand_accepts_quality_and_keyframe_flags() {
+    // Round 5 — the new --quality and --keyframe flags parse
+    // cleanly. Synthetic DLL is fine: we only care that the
+    // CLI doesn't reject the flags themselves before the load
+    // path fails.
+    let dll = write_synth_dll();
+    let bin = env!("CARGO_BIN_EXE_oxidetracevfw");
+    let out = Command::new(bin)
+        .arg(dll.path())
+        .arg("encode")
+        .args([
+            "--width",
+            "8",
+            "--height",
+            "8",
+            "--pattern",
+            "solid",
+            "--quality",
+            "7500",
+            "--keyframe",
+            "true",
+            "--input-format",
+            "bgr24",
+        ])
+        .output()
+        .expect("spawn oxidetracevfw");
+    // We expect non-zero exit (DriverProc-missing on synth DLL).
+    // But the failure must come from the codec stage, NOT from
+    // clap's argument parser — assert stderr doesn't contain
+    // typical clap "error: unexpected argument" markers.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("error: unexpected argument")
+            && !stderr.contains("error: invalid value")
+            && !stderr.contains("found argument"),
+        "clap rejected one of the new encode flags:\nstderr: {stderr}"
     );
 }
 

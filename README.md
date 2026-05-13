@@ -30,7 +30,16 @@ oxidetracevfw IR32_32.DLL \
     --trace-output /tmp/decode-trace.jsonl \
     decode --input keyframe.iv31 --width 64 --height 48
 
-# Drive synthetic encode against the codec.
+# Encode raw BGR24 pixels into a codec bitstream. Drives the full
+# ICCompressQuery → ICCompressGetFormat → ICCompressGetSize →
+# ICCompressBegin → ICCompress → ICCompressEnd lifecycle.
+oxidetracevfw mpg4c32.dll encode \
+    --input frame.bgr24 --width 176 --height 144 \
+    --input-format bgr24 --quality 5000 --keyframe true \
+    --output /tmp/encoded.mp43
+
+# Drive synthetic encode against the codec (no input file —
+# generates a gradient/solid/checkerboard pattern internally).
 oxidetracevfw IR32_32.DLL encode --width 320 --height 240 \
     --pattern gradient --output /tmp/encoded.iv31
 
@@ -63,7 +72,7 @@ oxidetracevfw <DLL_OR_AX_FILE> [OPTIONS] [SUBCOMMAND]
 
 Subcommands:
   probe             (default) load + DllMain + ICGetInfo + ICDecompressQuery
-  encode            drive ICCompress on synthetic input
+  encode            drive full ICCompress* lifecycle on raw / synthetic input
   decode            drive ICDecompress on input file
 
 Global options:
