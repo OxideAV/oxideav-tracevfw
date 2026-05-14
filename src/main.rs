@@ -41,10 +41,12 @@ fn main() -> Result<()> {
     sandbox.cpu.set_instr_limit(args.max_instr);
 
     // Trace-mode wiring (gated upstream on the `trace` Cargo
-    // feature in `oxideav-vfw`). All four surfaces reach
+    // feature in `oxideav-vfw`). All five surfaces reach
     // through to the same JSONL sink.
-    trace::install_sink(&mut sandbox, args.trace_output.as_deref())?;
+    let watches = trace::parse_watch_specs(&args.watch)?;
+    trace::install_sink(&mut sandbox, args.trace_output.as_deref(), &watches)?;
     trace::apply_trace_mem(&mut sandbox, &args.trace_mem)?;
+    trace::apply_watch(&mut sandbox, &watches);
     let breakpoints = trace::parse_breakpoints(&args.breakpoints)?;
     trace::record_breakpoints(&mut sandbox, &breakpoints);
     if args.asm {
@@ -104,7 +106,7 @@ fn main() -> Result<()> {
     // Always drain breakpoint hits — even on subcommand failure
     // the operator gets to see which registered PCs the codec
     // reached before the error surfaced.
-    trace::flush_breakpoint_events(&mut sandbox);
+    trace::flush_breakpoint_events(&mut sandbox, args.break_include_fpu);
 
     result
 }

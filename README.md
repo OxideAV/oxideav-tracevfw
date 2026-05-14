@@ -43,6 +43,15 @@ oxidetracevfw mpg4c32.dll encode \
 oxidetracevfw IR32_32.DLL encode --width 320 --height 240 \
     --pattern gradient --output /tmp/encoded.iv31
 
+# Watch a 2928-byte codec-context allocation and dump FPU/MMX
+# state at a known breakpoint — the Auditor's mpg4c32 recipe
+# for sandbox-01 §6.
+oxidetracevfw mpg4c32.dll decode --input frame.mp43 \
+    --watch 0x600002c0,2928 \
+    --break 0x1c2132b8 --break-include-fpu \
+    --trace-output /tmp/audit.jsonl \
+    --width 176 --height 144
+
 # GDB-attached interactive session: bind on port 1234, halt
 # the CPU pre-execution, and wait for `gdb`.
 oxidetracevfw IR32_32.DLL --gdb 0.0.0.0:1234
@@ -79,10 +88,24 @@ Global options:
   --asm                          enable per-instruction trace (requires
                                  oxideav-vfw built with `trace-exec`)
   --trace-mem <ADDR:SIZE[:MODE]> watch memory region; MODE = r|w|rw
-                                 (default rw); repeatable
+                                 (default rw); repeatable. Emits
+                                 kind=mem_read / kind=mem_write events
+                                 in the oxideav-vfw schema
+  --watch <ADDR[,LEN]>           watch memory region (read + write);
+                                 LEN defaults to 4 (one dword);
+                                 repeatable. Emits kind=mem_watch JSONL
+                                 events with an explicit `op` field
+                                 (`read` / `write`). Distinct from
+                                 --trace-mem — pick one or the other
+                                 per audit recipe
   --break <PC>                   PC breakpoint; emits kind=breakpoint JSONL
                                  with the integer register file at hit time
                                  (works in both CLI and --gdb modes)
+  --break-include-fpu            append a populated `fpu` sub-object to
+                                 every kind=breakpoint event — x87
+                                 ST(0..7), MMX MM0..MM7, tag, status,
+                                 control. Default off; see "Limitations"
+                                 for the live-read fidelity caveat
   --trace-output <FILE>          JSONL events output (default: stderr)
   --max-instr <N>                cap total instructions to prevent runaway
   --fcc-handler <FCC>            FourCC handler override
@@ -129,6 +152,33 @@ encode subcommand options:
   `--gdb HOST:PORT` and use `info reg all` for the full
   register file. Default cap on captures per run is 1024;
   hot-loop breakpoints past the cap are silently truncated.
+
+  Passing `--break-include-fpu` appends a `"fpu":{…}` sub-object
+  to every emitted `kind=breakpoint` line carrying x87
+  ST(0..7) (as IEEE-754 double bit-patterns in hex),
+  MMX MM0..MM7 (as u64 hex), tag word, status word, and control
+  word. Like `eflags`, these values are read LIVE at flush time
+  rather than from the snapshot ring — the underlying
+  `oxideav-vfw` snapshot hook does not preserve FPU state per
+  hit. For single-breakpoint runs this is identical to the
+  breakpoint-instant value; for multi-hit traces the emitted
+  FPU values reflect the END-of-run state. For per-hit FPU
+  fidelity, attach via `--gdb` and use `info reg all`.
+
+- **`--watch ADDR[,LEN]` and `--trace-mem ADDR:SIZE[:MODE]` are
+  parallel surfaces.** Both install a watchpoint via
+  `oxideav_vfw::Sandbox::watch`; the difference is the JSONL
+  schema and the convenience syntax:
+    * `--trace-mem` retains the original `kind=mem_read` /
+      `kind=mem_write` shape (one event per access; mode-
+      selectable; size required).
+    * `--watch` rewrites every matching access to the
+      `kind=mem_watch` shape with an explicit `op:"read"` /
+      `op:"write"` field; size defaults to 4 (one dword); both
+      reads and writes always fire.
+  An operator running both flags against overlapping ranges
+  will see the watched access rewritten to `kind=mem_watch`
+  (the wrapper short-circuits before the legacy schema emits).
 
 [`Cpu::add_register_watchpoint`]: https://docs.rs/oxideav-vfw/latest/oxideav_vfw/emulator/isa_int/struct.Cpu.html
 

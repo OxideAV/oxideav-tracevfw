@@ -44,6 +44,28 @@ pub struct Cli {
     #[arg(long = "break", value_name = "PC")]
     pub breakpoints: Vec<String>,
 
+    /// Include FPU (x87 ST(0..7) + tag + status) and MMX
+    /// (MM0..MM7) state in `kind=breakpoint` JSONL events. Off
+    /// by default — the GP-register-only shape is unchanged.
+    /// Limitation: FPU/MMX values are read live at flush time
+    /// (i.e. at subcommand exit), matching the existing live-eflags
+    /// pattern. For per-hit FPU fidelity across multiple
+    /// breakpoint hits, attach via `--gdb` and use `info reg all`.
+    #[arg(long = "break-include-fpu", default_value_t = false)]
+    pub break_include_fpu: bool,
+
+    /// Watch a memory region for reads + writes. `ADDR[,LEN]`
+    /// where ADDR is hex (`0x...`) or decimal and LEN is decimal
+    /// bytes (defaults to 4 — one dword — when omitted). Each
+    /// guest access whose range intersects the watched range
+    /// emits a `kind=mem_watch` JSONL event with `op` set to
+    /// `read` or `write`. Distinct from `--trace-mem` which
+    /// emits the pre-existing `kind=mem_read` / `kind=mem_write`
+    /// schema; pick one or the other per audit recipe.
+    /// Repeatable.
+    #[arg(long = "watch", value_name = "ADDR[,LEN]")]
+    pub watch: Vec<String>,
+
     /// JSONL trace events output file. Defaults to stderr.
     #[arg(long = "trace-output", value_name = "FILE")]
     pub trace_output: Option<PathBuf>,
@@ -315,6 +337,34 @@ pub fn parse_break(spec: &str) -> Result<u32> {
     parse_u32(spec).context("parsing breakpoint PC")
 }
 
+/// Parse a `--watch ADDR[,LEN]` spec into `(addr, len)`. The
+/// LEN suffix is optional; `4` (one dword) is the default — most
+/// codec context-allocation traces are interested in dword
+/// fields. ADDR may be hex (`0x...`) or decimal; LEN is decimal
+/// bytes. The flag intentionally drops the mode selector of
+/// `--trace-mem` — `--watch` always covers both reads and writes
+/// (matching the GDB `Z2` access-watchpoint semantics the
+/// Auditor's recipes lean on).
+pub fn parse_watch(spec: &str) -> Result<(u32, u32)> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return Err(anyhow!(
+            "expected ADDR[,LEN], got {spec:?} ({} parts)",
+            parts.len()
+        ));
+    }
+    let addr = parse_u32(parts[0]).context("parsing watch ADDR")?;
+    let len = if parts.len() == 2 {
+        parse_u32(parts[1]).context("parsing watch LEN")?
+    } else {
+        4
+    };
+    if len == 0 {
+        return Err(anyhow!("watch LEN must be >= 1, got 0"));
+    }
+    Ok((addr, len))
+}
+
 fn parse_u32(s: &str) -> Result<u32> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -360,6 +410,30 @@ mod tests {
     fn parse_break_accepts_hex_and_decimal() {
         assert_eq!(parse_break("0x10004A17").unwrap(), 0x10004A17);
         assert_eq!(parse_break("256").unwrap(), 256);
+    }
+
+    #[test]
+    fn parse_watch_default_len_is_four() {
+        let (addr, len) = parse_watch("0x600002c0").unwrap();
+        assert_eq!(addr, 0x600002c0);
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn parse_watch_explicit_len() {
+        let (addr, len) = parse_watch("0x600002c0,2928").unwrap();
+        assert_eq!(addr, 0x600002c0);
+        assert_eq!(len, 2928);
+    }
+
+    #[test]
+    fn parse_watch_rejects_zero_len() {
+        assert!(parse_watch("0x1000,0").is_err());
+    }
+
+    #[test]
+    fn parse_watch_rejects_too_many_parts() {
+        assert!(parse_watch("0x1000,4,extra").is_err());
     }
 
     #[test]

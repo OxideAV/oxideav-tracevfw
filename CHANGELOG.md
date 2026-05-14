@@ -8,6 +8,89 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auditor follow-up — `--watch ADDR[,LEN]` memory watchpoints.**
+  New global flag that installs a read+write watchpoint
+  covering `[addr, addr+len)` via the existing
+  `oxideav_vfw::Sandbox::watch` API (mode = `WatchMode::Both`),
+  then transforms the resulting `kind=mem_read` /
+  `kind=mem_write` JSONL events into the new `kind=mem_watch`
+  shape with an explicit `op:"read"` / `op:"write"` field
+  before they reach the `--trace-output` sink. LEN defaults to
+  `4` (one dword) when omitted; the flag is repeatable.
+
+  Example emission (real `dump_sample` trace, synth DLL):
+
+  ```json
+  {"kind":"mem_watch","op":"write","addr":"0x900ffef0","size":4,"value":"0xfffffff0","eip":"0x00000000"}
+  {"kind":"mem_watch","op":"read","addr":"0x900ffef0","size":4,"value":"0xfffffff0","eip":"0x10001000"}
+  ```
+
+  Distinct from the existing `--trace-mem ADDR:SIZE[:MODE]`
+  surface (kept untouched for backward compatibility) — pick
+  one per audit recipe. The wrapper transforms in place, so an
+  operator setting both flags against overlapping ranges sees
+  the matched access emitted ONCE as `kind=mem_watch` (the
+  upstream `kind=mem_read` / `kind=mem_write` event for the
+  same access is short-circuited by the sink wrapper).
+
+  Implementation: `MemWatchSink` is a line-buffered `Write`
+  wrapper around the user-supplied `--trace-output` file (or
+  stderr). It scans each emitted JSONL line for the
+  `"kind":"mem_read"` / `"kind":"mem_write"` prefix, extracts
+  the `addr` field, and rewrites the line to `kind=mem_watch`
+  if `addr` falls in any registered `--watch (addr, len)`
+  range. Unmatched lines (including `--trace-mem` events
+  outside the watched range, plus all `win32_call` / `exec` /
+  `trap` / `breakpoint` events) pass through verbatim.
+
+  New integration tests (`tests/round_next_watch_and_fpu.rs`):
+  `watch_flag_emits_kind_mem_watch_for_stack_pop`,
+  `watch_flag_default_len_is_four`. Five unit tests cover the
+  parser (default len, explicit len, zero-len rejection,
+  too-many-parts rejection) and the sink wrapper (rewrite
+  read, rewrite write, pass-through unrelated lines).
+
+- **Auditor follow-up — `--break-include-fpu` flag.**
+  Opt-in switch that appends a populated `"fpu":{…}`
+  sub-object to every `kind=breakpoint` event drained by the
+  CLI-mode breakpoint hook. The sub-object carries:
+    * `st` — x87 ST(0..7), each as the IEEE-754 double
+      bit-pattern (16-char hex). Order matches the
+      architectural top-of-stack semantics (ST(0) first); a
+      tag of `0` for the slot indicates Empty.
+    * `mm` — MMX MM0..MM7 as u64 hex.
+    * `tag` — 16-bit packed tag word (bit `i` = ST(i) valid).
+    * `status` — x87 FNSTSW value.
+    * `control` — x87 FLDCW shadow.
+
+  Example emission (real `dump_sample` trace, synth DLL):
+
+  ```json
+  {"kind":"breakpoint","eip":"0x10001000","regs":{"eax":"0x00000000",…,"eflags":"0x00000002"},"fpu":{"st":["0x0000…",…,"0x0000…"],"mm":["0x0000…",…,"0x0000…"],"tag":"0x0000","status":"0x0000","control":"0x037f"}}
+  ```
+
+  Default behaviour (flag absent) is unchanged — the GP-only
+  shape from the round-77e061d implementation remains the
+  emission for legacy traces.
+
+  Limitation: the upstream `oxideav_vfw::Cpu::add_register_watchpoint`
+  snapshot hook captures GP regs only, so FPU/MMX state is read
+  LIVE at drain time (i.e. at subcommand exit). For
+  single-breakpoint runs this matches the breakpoint instant;
+  for multi-hit traces the emitted values reflect end-of-run
+  state. For per-hit FPU fidelity, attach via `--gdb` and step
+  manually — `info reg all` reads the architectural register
+  file directly.
+
+  New integration tests (`tests/round_next_watch_and_fpu.rs`):
+  `break_include_fpu_appends_fpu_field_to_breakpoint_event`
+  asserts the `"fpu":{"st":[…],"mm":[…],"tag":…,…}` shape;
+  `break_without_include_fpu_keeps_gp_only_shape` asserts the
+  flag is opt-in. One additional unit test
+  (`flush_breakpoint_events_with_include_fpu_appends_fpu_field`)
+  seeds FPU + MMX values, drains a synthetic breakpoint, and
+  validates every emitted hex field.
+
 - **Auditor follow-up — `--break PC` no longer a no-op in CLI mode (P1).**
   Wires the registered breakpoint PCs into the per-instruction
   register-snapshot hook on `oxideav_vfw::Cpu`
