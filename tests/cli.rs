@@ -935,9 +935,18 @@ fn break_flag_echoes_count_to_stderr() {
         .unwrap();
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Round-N: the stderr line went from "breakpoint(s) registered
+    // — round-1 surfaces hits via …" to
+    // "breakpoint(s) armed via the per-instruction register-snapshot hook"
+    // when `--break` stopped being a no-op. Both phrasings still
+    // mention "breakpoint(s)", so we keep the loose match here.
     assert!(
-        stderr.contains("breakpoint(s) registered"),
+        stderr.contains("breakpoint(s)"),
         "expected breakpoint registration log on stderr, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("0x10004a17"),
+        "expected echoed PC on stderr, got: {stderr:?}"
     );
 }
 

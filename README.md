@@ -80,14 +80,57 @@ Global options:
                                  oxideav-vfw built with `trace-exec`)
   --trace-mem <ADDR:SIZE[:MODE]> watch memory region; MODE = r|w|rw
                                  (default rw); repeatable
-  --break <PC>                   PC breakpoint; dump CPU state when reached
+  --break <PC>                   PC breakpoint; emits kind=breakpoint JSONL
+                                 with the integer register file at hit time
+                                 (works in both CLI and --gdb modes)
   --trace-output <FILE>          JSONL events output (default: stderr)
   --max-instr <N>                cap total instructions to prevent runaway
   --fcc-handler <FCC>            FourCC handler override
   --gdb <HOST:PORT>              bind a GDB Remote Serial Protocol server;
                                  use `:0` to pick a free port (printed
                                  to stderr as `[gdb] listening on …`)
+
+encode subcommand options:
+  --input <FILE>                 raw uncompressed pixel bytes (header-less)
+  --width <N> --height <N>       frame dimensions (also used for synthesis)
+  --input-format <FORMAT>        bgr24 (default) | bgr32 | yv12 | i420 | yuy2
+  --pattern <NAME>               gradient (default) | solid | checkerboard
+                                 (only used when --input is absent)
+  --quality <0..=10000>          ICCOMPRESS::dwQuality; default 5000
+  --pquant <1..=31>              override the picture-header PQUANT field
+                                 directly on the encoded bitstream (see
+                                 "Limitations" below)
+  --keyframe <BOOL>              ICCOMPRESS_KEYFRAME flag; default true
+  --output-fourcc <FCC>          override the codec's chosen output FOURCC
+  --output <FILE>                where to write encoded bytes (default stdout)
 ```
+
+## Limitations
+
+- **`--pquant N` is a post-processing patch, not an encoder
+  knob.** The MS-MPEG-4 v3 codec (`mpg4c32.dll`) clamps its
+  picture-header PQUANT to a constant (PQUANT=4) regardless of
+  the `--quality` value passed in `ICCOMPRESS::dwQuality`. The
+  proper override path is `ICM_GETSTATE` / `ICM_SETSTATE`, but
+  `oxideav_vfw::Sandbox` does not yet expose `ic_get_state` /
+  `ic_set_state` as host helpers (cross-crate followup tracked
+  in OxideAV/oxideav-vfw). As a workaround, `--pquant N` rewrites
+  the 5-bit PQUANT field at bit offset 2 of the picture header
+  (MSB-first within byte 0) on the bitstream returned by
+  `ICCompress`. The rewrite targets the v3 layout — operators
+  using v1/v2/v4 codecs need a different bit offset.
+
+- **`--break PC` register snapshot has GP-register fidelity, not
+  full FPU/SSE state.** The per-instruction snapshot hook
+  ([`Cpu::add_register_watchpoint`]) captures the eight integer
+  registers (eax/ecx/edx/ebx/esp/ebp/esi/edi) plus a live
+  `eflags` read at drain time. Floating-point / MMX / SSE state
+  at the breakpoint instant is not captured — attach via
+  `--gdb HOST:PORT` and use `info reg all` for the full
+  register file. Default cap on captures per run is 1024;
+  hot-loop breakpoints past the cap are silently truncated.
+
+[`Cpu::add_register_watchpoint`]: https://docs.rs/oxideav-vfw/latest/oxideav_vfw/emulator/isa_int/struct.Cpu.html
 
 ## Provenance
 

@@ -8,6 +8,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auditor follow-up — `--break PC` no longer a no-op in CLI mode (P1).**
+  Wires the registered breakpoint PCs into the per-instruction
+  register-snapshot hook on `oxideav_vfw::Cpu`
+  ([`add_register_watchpoint`]), so the next time the CPU's
+  `step` loop visits a registered EIP the integer register file
+  is captured. At subcommand exit, captured snapshots are
+  drained and emitted as `kind=breakpoint` JSONL events into
+  the trace sink (`--trace-output FILE` or stderr):
+
+  ```json
+  {"kind":"breakpoint","eip":"0x10001000","regs":{"eax":"0x...",...,"eflags":"0x..."}}
+  ```
+
+  Previously, `--break PC` outside `--gdb HOST:PORT` only
+  echoed the registered count to stderr; the operator had to
+  attach a GDB client to get the same evidence. The default
+  capture cap is bumped from 16 to 1024 per run.
+
+  GP-register fidelity (eax/ecx/edx/ebx/esp/ebp/esi/edi) plus
+  a live `eflags` read at drain time. FPU / MMX / SSE state at
+  the breakpoint instant is not captured — attach via `--gdb`
+  for the full register file.
+
+  New integration tests (`tests/break_emits_jsonl.rs`):
+  `break_pc_emits_kind_breakpoint_into_trace_output_in_cli_mode`,
+  `no_break_flag_emits_no_kind_breakpoint_events`.
+
+- **Auditor follow-up — `encode --pquant N` knob (P2).**
+  Adds an explicit `--pquant N` flag (`N` ∈ 1..=31) on the
+  `encode` subcommand that rewrites the picture-header PQUANT
+  field on the encoded output. Targets the MS-MPEG-4 v3 layout
+  (5 bits at bit offset 2 of byte 0, MSB-first). Workaround
+  for `mpg4c32.dll`'s rate-control clamp that bakes
+  PQUANT=4 into every output regardless of `--quality`. The
+  proper override path (`ICM_SETSTATE`) remains unavailable
+  until `oxideav-vfw` exposes `ic_get_state` / `ic_set_state`
+  as host helpers — see README "Limitations".
+
+  New integration tests (`tests/encode_pquant.rs`):
+  `encode_pquant_flag_rewrites_picture_header_pquant_field`
+  asserts the byte-0 PQUANT reads as 1 / 31 after
+  `--pquant 1` / `--pquant 31`;
+  `encode_without_pquant_does_not_patch_output` asserts the
+  flag is opt-in (default codec output unchanged).
+
+[`add_register_watchpoint`]: https://docs.rs/oxideav-vfw/latest/oxideav_vfw/emulator/isa_int/struct.Cpu.html#method.add_register_watchpoint
+
 - **Round 5 P3 — `encode` subcommand wired to `ICCompress*` (P1).**
   The `encode` subcommand now drives the full
   `ICOpen(ICMODE_COMPRESS)` → `ICCompressQuery` →

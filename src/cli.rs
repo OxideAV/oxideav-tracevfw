@@ -122,6 +122,20 @@ pub enum Command {
         #[arg(long, default_value_t = 5000)]
         quality: u32,
 
+        /// Override the picture-header PQUANT field (1..=31)
+        /// directly on the encoded bitstream. Useful for codecs
+        /// that bake a constant PQUANT regardless of `--quality`
+        /// (mpg4c32 v3 is the canonical case — its rate-control
+        /// path clamps to PQUANT=4 unless ICM_SETSTATE is used,
+        /// which is not yet exposed on `oxideav_vfw::Sandbox`).
+        ///
+        /// Implementation: post-processes the codec's output by
+        /// rewriting the 5-bit PQUANT field at bit offset 2 of
+        /// the picture header (MSB-first). Currently targets
+        /// MS-MPEG-4 v3 layout — see `README.md` "Limitations".
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=31))]
+        pquant: Option<u8>,
+
         /// Request a keyframe (sets `ICCOMPRESS_KEYFRAME` in
         /// `dwFlags`). Default `true` — the first frame of an
         /// encode session must be a keyframe; the codec is also

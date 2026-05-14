@@ -48,6 +48,7 @@ pub fn run(
     input_format: InputFormat,
     pattern: Pattern,
     quality: u32,
+    pquant: Option<u8>,
     keyframe: bool,
     output_fourcc: Option<&str>,
     output: Option<PathBuf>,
@@ -246,17 +247,42 @@ pub fn run(
         anyhow::bail!("ICCompress returned zero encoded bytes");
     }
 
+    // Optional post-processing: rewrite the picture-header PQUANT
+    // field. Targets the MS-MPEG-4 v3 picture-header layout
+    // (2-bit picture_type, 5-bit pquant, MSB-first within the
+    // first byte). See `oxideav-msmpeg4::header::MsV3PictureHeader`
+    // for the authoritative layout citation. Documented as a
+    // workaround in `README.md` "Limitations" — the proper path
+    // is `Sandbox::ic_get_state` / `ic_set_state` once oxideav-vfw
+    // exposes them.
+    let mut bytes = outcome.bytes;
+    if let Some(q) = pquant {
+        let q5 = q & 0x1F; // already validated 1..=31 by clap range
+        if let Some(byte0) = bytes.first_mut() {
+            let before = *byte0;
+            *byte0 = (before & 0b1100_0001) | (q5 << 1);
+            println!(
+                "[encode] --pquant {q}: rewrote picture-header byte 0 \
+                 from 0x{before:02x} to 0x{:02x} \
+                 (5-bit PQUANT field at bit offset 2, MSB-first)",
+                *byte0,
+            );
+        } else {
+            println!("[encode] --pquant {q}: encoded output is empty; nothing to patch");
+        }
+    }
+
     if let Some(path) = output {
         let mut f = std::fs::File::create(&path)
             .with_context(|| format!("creating output {}", path.display()))?;
-        f.write_all(&outcome.bytes)?;
+        f.write_all(&bytes)?;
         println!(
             "[encode] wrote {} encoded bytes to {}",
-            outcome.bytes.len(),
+            bytes.len(),
             path.display()
         );
     } else {
-        std::io::stdout().write_all(&outcome.bytes)?;
+        std::io::stdout().write_all(&bytes)?;
     }
 
     Ok(())

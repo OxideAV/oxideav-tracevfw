@@ -51,12 +51,12 @@ fn main() -> Result<()> {
         trace::enable_asm(&mut sandbox);
     }
 
-    match args.command.unwrap_or(Command::Probe) {
+    let result = match args.command.unwrap_or(Command::Probe) {
         Command::Probe => probe::run(
             &mut sandbox,
             &args.dll_or_ax_file,
             args.fcc_handler.as_deref(),
-        )?,
+        ),
         Command::Encode {
             input,
             width,
@@ -64,6 +64,7 @@ fn main() -> Result<()> {
             input_format,
             pattern,
             quality,
+            pquant,
             keyframe,
             output_fourcc,
             output,
@@ -77,10 +78,11 @@ fn main() -> Result<()> {
             input_format,
             pattern,
             quality,
+            pquant,
             keyframe,
             output_fourcc.as_deref(),
             output,
-        )?,
+        ),
         Command::Decode {
             input,
             width,
@@ -96,8 +98,13 @@ fn main() -> Result<()> {
             height,
             pix_format,
             output,
-        )?,
-    }
+        ),
+    };
 
-    Ok(())
+    // Always drain breakpoint hits — even on subcommand failure
+    // the operator gets to see which registered PCs the codec
+    // reached before the error surfaced.
+    trace::flush_breakpoint_events(&mut sandbox);
+
+    result
 }
