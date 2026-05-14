@@ -6,6 +6,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-tracevfw/compare/v0.0.1...v0.0.2) - 2026-05-14
+
+### Other
+
+- Auditor follow-up: --watch ADDR[,LEN] + --break-include-fpu
+- Auditor follow-up: --break PC + encode --pquant N
+- use oxideav_vfw::ICINFO_SIZE = 568 instead of hard-coded 112
+- Round 5 P3 — encode subcommand wired to ICCompress* (oxideav-vfw r51)
+- Round 15 — IMAGE_IMPORT_DIRECTORY (DataDirectory[1]) + env-var test mutex
+- Round 14 — per-export 8-byte stubs + IMAGE_DEBUG_DIRECTORY / CodeView RSDS
+- Round 13 — PE Export Directory + env-pinned PE TimeDateStamp
+- Round 12 — synthesise minimal valid PE32 for cascade module stubs
+- Round 11 — vFile:fstat + vFile:open for cascade-loaded modules
+- Round 10 — qRcmd monitor commands + vFile host_io for DLL bytes
+- Round 9 — qXfer:auxv:read + qfThreadInfo wire-level pin
+- Round 8 — qXfer:libraries:read loaded-module registry
+- Round 7 — qXfer:memory-map:read + qXfer:exec-file:read
+- Round 6 — qXfer:features:read + real-codec smoke matrix
+- Round 5 — single-register P/p packets + --break JSONL events
+- Round 4 — --gdb honours --trace-output, Z2 protocol-level test
+- Round 3 — Watch stop-reasons, MMX register surface, encode/decode status
+
 ### Added
 
 - **Auditor follow-up — `--watch ADDR[,LEN]` memory watchpoints.**
